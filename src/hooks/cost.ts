@@ -25,6 +25,20 @@ export function registerCostHandler(
   api.on("before_agent_start", async (event: any, ctx: any) => {
     if (!event?.messages || !Array.isArray(event.messages)) return;
 
+    // Detect heartbeat-triggered turns by scanning the last user message
+    // OpenClaw heartbeat prompts always contain "HEARTBEAT" (e.g. "Read HEARTBEAT.md")
+    let isHeartbeat = false;
+    for (let i = event.messages.length - 1; i >= 0; i--) {
+      const m = event.messages[i];
+      if (m?.role === "user") {
+        const text = typeof m.content === "string" ? m.content : JSON.stringify(m.content ?? "");
+        if (/HEARTBEAT/i.test(text)) {
+          isHeartbeat = true;
+        }
+        break; // only check the last user message
+      }
+    }
+
     for (const msg of event.messages) {
       // Only assistant messages have usage data
       if (msg.role !== "assistant") continue;
@@ -55,6 +69,8 @@ export function registerCostHandler(
         totalTokens: msg.usage.totalTokens ?? ((msg.usage.input ?? 0) + (msg.usage.output ?? 0)),
         costUsd: costTotal,
         durationMs: undefined,
+        // Tag heartbeat-triggered cost events so the dashboard can distinguish them
+        ...(isHeartbeat ? { sessionType: "heartbeat" } : {}),
       });
     }
 

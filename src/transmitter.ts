@@ -151,8 +151,14 @@ function buildDescription(event: PodwatchEvent): string {
 
 /**
  * Determine sessionType from the internal event.
+ * If the event already carries an explicit sessionType (e.g. set by cost handler
+ * for heartbeat-triggered LLM calls), use it directly.
  */
 function mapSessionType(event: PodwatchEvent): "interactive" | "heartbeat" | "cron" | "unknown" {
+  // Allow upstream hooks to pre-set sessionType (e.g. heartbeat cost events)
+  if (typeof event.sessionType === "string" && event.sessionType) {
+    return event.sessionType as "interactive" | "heartbeat" | "cron" | "unknown";
+  }
   if (event.type === "heartbeat") return "heartbeat";
   if (event.type === "scan") return "cron";
   // Tool calls, tool results, cost, security, session events = interactive
