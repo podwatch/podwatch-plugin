@@ -93,15 +93,57 @@ function mapResultStatus(event: PodwatchEvent): string {
 function buildDescription(event: PodwatchEvent): string {
   const parts: string[] = [];
 
-  if (event.type) parts.push(String(event.type));
-
-  if (event.pattern) parts.push(String(event.pattern));
-  if (event.severity) parts.push(`severity=${event.severity}`);
-  if (event.reason) parts.push(String(event.reason));
-  if (event.message) parts.push(String(event.message));
-  if (event.error) parts.push(`error: ${String(event.error).slice(0, 200)}`);
-  if (event.loopDetected) parts.push(`loop_detected (${event.messagesPerMinute} msg/min)`);
-  if (event.riskLevel && event.riskLevel !== "SAFE") parts.push(`risk=${event.riskLevel}`);
+  switch (event.type) {
+    case "tool_call": {
+      const name = event.toolName ? String(event.toolName) : "unknown_tool";
+      parts.push(`Called: ${name}`);
+      if (event.riskLevel && event.riskLevel !== "SAFE") parts.push(`risk=${event.riskLevel}`);
+      break;
+    }
+    case "tool_result": {
+      const name = event.toolName ? String(event.toolName) : "unknown_tool";
+      const status = event.success === false ? "error" : "success";
+      parts.push(`${name}: ${status}`);
+      if (event.error) parts.push(String(event.error).slice(0, 200));
+      break;
+    }
+    case "cost": {
+      const model = event.model ? String(event.model) : "unknown_model";
+      const cost = typeof event.costUsd === "number" ? `$${event.costUsd.toFixed(4)}` : "$?";
+      const tokens = typeof event.totalTokens === "number" ? `${event.totalTokens} tokens` : "? tokens";
+      parts.push(`${model}: ${cost} (${tokens})`);
+      break;
+    }
+    case "security": {
+      if (event.pattern) parts.push(String(event.pattern));
+      if (event.severity) parts.push(`severity=${event.severity}`);
+      if (event.reason) parts.push(String(event.reason));
+      break;
+    }
+    case "session_start": {
+      parts.push("Session started");
+      if (event.sessionId) parts.push(`id=${event.sessionId}`);
+      break;
+    }
+    case "session_end": {
+      parts.push("Session ended");
+      if (event.sessionId) parts.push(`id=${event.sessionId}`);
+      if (typeof event.durationMs === "number") parts.push(`duration=${Math.round(Number(event.durationMs) / 1000)}s`);
+      break;
+    }
+    default: {
+      if (event.type) parts.push(String(event.type));
+      if (event.toolName) parts.push(String(event.toolName));
+      if (event.pattern) parts.push(String(event.pattern));
+      if (event.severity) parts.push(`severity=${event.severity}`);
+      if (event.reason) parts.push(String(event.reason));
+      if (event.message) parts.push(String(event.message));
+      if (event.error) parts.push(`error: ${String(event.error).slice(0, 200)}`);
+      if (event.loopDetected) parts.push(`loop_detected (${event.messagesPerMinute} msg/min)`);
+      if (event.riskLevel && event.riskLevel !== "SAFE") parts.push(`risk=${event.riskLevel}`);
+      break;
+    }
+  }
 
   const desc = parts.join(": ");
   return desc.slice(0, 2000);
@@ -117,6 +159,64 @@ function mapSessionType(event: PodwatchEvent): "interactive" | "heartbeat" | "cr
 }
 
 /**
+ * Extract agentId from a sessionKey string.
+ * SessionKey format: "agent:<agentId>:<sessionType>:..."
+ */
+function extractAgentIdFromSessionKey(sessionKey: string): string | undefined {
+  if (!sessionKey || typeof sessionKey !== "string") return undefined;
+  const parts = sessionKey.split(":");
+  // Format: agent:<agentId>:<rest...>
+  if (parts.length >= 2 && parts[0] === "agent") {
+    return parts[1] || undefined;
+  }
+  return undefined;
+}
+
+/**
+ * Resolve agentId with fallback chain:
+ * 1. event.agentId (if present)
+ * 2. Extract from event.sessionKey
+ * 3. Default to "main"
+ */
+function resolveAgentId(event: PodwatchEvent): string {
+  if (event.agentId != null && String(event.agentId).length > 0) {
+    return String(event.agentId);
+  }
+  const sessionKey = (event.sessionKey ?? event.sessionId) as string | undefined;
+  if (sessionKey) {
+    const extracted = extractAgentIdFromSessionKey(sessionKey);
+    if (extracted) return extracted;
+  }
+  return "main";
+}
+
+/**
+ * Resolve sessionId with fallback chain:
+ * 1. event.sessionKey (if present)
+ * 2. event.sessionId
+ * 3. Default to "default"
+ */
+function resolveSessionId(event: PodwatchEvent): string {
+  if (event.sessionKey != null && String(event.sessionKey).length > 0) {
+    return String(event.sessionKey);
+  }
+  if (event.sessionId != null && String(event.sessionId).length > 0) {
+    return String(event.sessionId);
+  }
+  return "default";
+}
+
+/**
+ * Resolve toolName — for cost events, use the model name instead of generic "cost".
+ */
+function resolveToolName(event: PodwatchEvent): string {
+  if (event.type === "cost" && typeof event.model === "string" && event.model) {
+    return event.model;
+  }
+  return (typeof event.toolName === "string" && event.toolName) || event.type as string || "system";
+}
+
+/**
  * Transform internal PodwatchEvent[] into the API-expected EventPayload[].
  */
 function transformEvents(events: PodwatchEvent[]): Record<string, unknown>[] {
@@ -124,16 +224,15 @@ function transformEvents(events: PodwatchEvent[]): Record<string, unknown>[] {
     const transformed: Record<string, unknown> = {
       eventId: typeof event.eventId === "string" ? event.eventId : crypto.randomUUID(),
       timestamp: new Date(event.ts).toISOString(),
-      toolName: (typeof event.toolName === "string" && event.toolName) || event.type || "system",
+      toolName: resolveToolName(event),
       resultStatus: mapResultStatus(event),
       description: buildDescription(event),
       sessionType: mapSessionType(event),
+      agentId: resolveAgentId(event),
+      sessionId: resolveSessionId(event),
     };
 
     // Optional fields — only include if present
-    if (event.agentId != null) transformed.agentId = String(event.agentId);
-    if (event.sessionKey != null) transformed.sessionId = String(event.sessionKey);
-    else if (event.sessionId != null) transformed.sessionId = String(event.sessionId);
     if (event.model != null) transformed.model = String(event.model);
     if (typeof event.inputTokens === "number") transformed.inputTokens = event.inputTokens;
     if (typeof event.outputTokens === "number") transformed.outputTokens = event.outputTokens;
