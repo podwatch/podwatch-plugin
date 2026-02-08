@@ -46,10 +46,9 @@ const CREDENTIAL_PATHS = [
   /secrets?\.(ya?ml|json|toml)/i,
   /\.kube\/config/i,
   /\.docker\/config\.json/i,
-  /token/i,
-  /password/i,
-  /apikey/i,
-  /api_key/i,
+  /[\\/]\.?tokens?\.[\w]+$/i,      // files named "token.json", ".tokens.yaml" etc (not the word "token" anywhere)
+  /[\\/]\.?passwords?\.[\w]+$/i,   // files named "password.txt", "passwords.json" etc
+  /[\\/]\.?api_?keys?\.[\w]+$/i,   // files named "apikey.json", "api_keys.yaml" etc
 ];
 
 const WARNING_PATHS = [
@@ -89,7 +88,7 @@ const DANGER_COMMANDS = [
   /rm\s+-rf\s+\//i,
   /mkfs/i,
   /dd\s+if=/i,
-  />\s*\/dev\//i,
+  /(?<![12])>\s*\/dev\/(?!null)/i,  // Block writes to /dev/ EXCEPT /dev/null and stderr/stdout redirects (1>, 2>)
   /chmod\s+777/i,
   /curl.*\|\s*(bash|sh)/i,
   /wget.*\|\s*(bash|sh)/i,

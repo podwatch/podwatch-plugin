@@ -23,41 +23,53 @@ let scanTimer: ReturnType<typeof setInterval> | null = null;
  */
 export function registerLifecycleHandlers(api: any, config: PodwatchConfig): void {
   console.log("[podwatch:debug] registerLifecycleHandlers() called");
+
   // -----------------------------------------------------------------------
-  // gateway_start — heartbeat + initial scan
+  // Heartbeat + scan — run immediately during register() since
+  // gateway_start is never emitted to plugins.
+  // -----------------------------------------------------------------------
+
+  // Send initial heartbeat right now
+  console.log("[podwatch:debug] Starting heartbeat timer from register()");
+  sendHeartbeat();
+
+  // Start heartbeat interval
+  if (heartbeatTimer) clearInterval(heartbeatTimer);
+  heartbeatTimer = setInterval(sendHeartbeat, config.heartbeatIntervalMs ?? 60_000);
+  if (heartbeatTimer && typeof heartbeatTimer === "object" && "unref" in heartbeatTimer) {
+    heartbeatTimer.unref();
+  }
+
+  // Initial skill/plugin scan (fallback — also attempted in gateway_start)
+  const workspaceDir = api.config?.agents?.defaults?.workspace;
+  console.log("[podwatch:debug] Running initial scan from register()");
+  void runScan(workspaceDir);
+
+  // Start periodic scan interval
+  if (scanTimer) clearInterval(scanTimer);
+  scanTimer = setInterval(
+    () => void runScan(workspaceDir),
+    config.scanIntervalMs ?? 21_600_000
+  );
+  if (scanTimer && typeof scanTimer === "object" && "unref" in scanTimer) {
+    scanTimer.unref();
+  }
+
+  api.logger.info(
+    `[podwatch/lifecycle] Heartbeat & scan started from register(). Heartbeat: ${config.heartbeatIntervalMs ?? 60_000}ms, Scan: ${config.scanIntervalMs ?? 21_600_000}ms`
+  );
+
+  // -----------------------------------------------------------------------
+  // gateway_start — best-effort re-scan (in case it ever fires)
   // -----------------------------------------------------------------------
   api.on(
     "gateway_start",
     async (event: GatewayStartEvent): Promise<void> => {
-      console.log("[podwatch:debug] === gateway_start ===");
+      console.log("[podwatch:debug] === gateway_start (best-effort) ===");
       console.log("[podwatch:debug] gateway_start event:", JSON.stringify(event, null, 2));
-      // Send initial heartbeat
-      sendHeartbeat();
 
-      // Start heartbeat interval
-      if (heartbeatTimer) clearInterval(heartbeatTimer);
-      heartbeatTimer = setInterval(sendHeartbeat, config.heartbeatIntervalMs ?? 60_000);
-      if (heartbeatTimer && typeof heartbeatTimer === "object" && "unref" in heartbeatTimer) {
-        heartbeatTimer.unref();
-      }
-
-      // Initial skill/plugin scan
-      const workspaceDir = api.config?.agents?.defaults?.workspace;
-      void runScan(workspaceDir);
-
-      // Start periodic scan interval
-      if (scanTimer) clearInterval(scanTimer);
-      scanTimer = setInterval(
-        () => void runScan(workspaceDir),
-        config.scanIntervalMs ?? 21_600_000
-      );
-      if (scanTimer && typeof scanTimer === "object" && "unref" in scanTimer) {
-        scanTimer.unref();
-      }
-
-      api.logger.info(
-        `[podwatch/lifecycle] Gateway started. Heartbeat: ${config.heartbeatIntervalMs ?? 60_000}ms, Scan: ${config.scanIntervalMs ?? 21_600_000}ms`
-      );
+      // Re-run scan as best-effort; heartbeat is already running
+      void runScan(api.config?.agents?.defaults?.workspace);
     }
   );
 
