@@ -1,0 +1,53 @@
+{
+  "id": "podwatch",
+  "name": "podwatch",
+  "version": "0.1.0",
+  "description": "Cost monitoring, budget enforcement, and security alerts for OpenClaw agents",
+  "entry": "./dist/index.js",
+  "skills": ["./skills/podwatch"],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "apiKey": {
+        "type": "string",
+        "description": "Your Podwatch API key from podwatch.app/settings"
+      },
+      "endpoint": {
+        "type": "string",
+        "description": "Podwatch API endpoint",
+        "default": "https://podwatch.app/api"
+      },
+      "enableBudgetEnforcement": {
+        "type": "boolean",
+        "description": "Block tool calls when budget is exceeded",
+        "default": true
+      },
+      "enableSecurityAlerts": {
+        "type": "boolean",
+        "description": "Monitor for suspicious tool patterns",
+        "default": true
+      },
+      "heartbeatIntervalMs": {
+        "type": "number",
+        "description": "Heartbeat interval in milliseconds",
+        "default": 60000
+      },
+      "scanIntervalMs": {
+        "type": "number",
+        "description": "How often to scan installed skills/plugins (ms)",
+        "default": 21600000
+      }
+    },
+    "required": []
+  },
+  "uiHints": {
+    "apiKey": { "label": "API Key", "sensitive": true, "placeholder": "pw_..." },
+    "endpoint": { "label": "API Endpoint" },
+    "enableBudgetEnforcement": { "label": "Budget Enforcement" },
+    "enableSecurityAlerts": { "label": "Security Alerts" },
+    "heartbeatIntervalMs": { "label": "Heartbeat Interval (ms)" },
+    "scanIntervalMs": { "label": "Scan Interval (ms)" }
+  },
+  "requiresDiagnostics": true
+}

@@ -1,0 +1,42 @@
+{
+  "name": "@podwatch/podwatch",
+  "version": "0.1.0",
+  "description": "Cost monitoring, budget enforcement, and security alerts for OpenClaw agents",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist/",
+    "skills/",
+    "openclaw.plugin.json"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "clean": "rm -rf dist",
+    "prepublishOnly": "npm run build"
+  },
+  "openclaw": {
+    "plugin": true,
+    "extensions": ["./dist/index.js"]
+  },
+  "keywords": [
+    "openclaw",
+    "openclaw-plugin",
+    "monitoring",
+    "cost-tracking",
+    "security",
+    "observability",
+    "budget-enforcement"
+  ],
+  "author": "Rafael Urena",
+  "license": "MIT",
+  "homepage": "https://podwatch.app",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jaime-perez-dev/podwatch-plugin"
+  },
+  "devDependencies": {
+    "@types/node": "^25.2.1",
+    "typescript": "^5.7.0"
+  }
+}
