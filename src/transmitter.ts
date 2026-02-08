@@ -154,7 +154,12 @@ function buildDescription(event: PodwatchEvent): string {
  */
 function mapSessionType(event: PodwatchEvent): "interactive" | "heartbeat" | "cron" | "unknown" {
   if (event.type === "heartbeat") return "heartbeat";
-  // Could detect cron sessions from context in the future
+  if (event.type === "scan") return "cron";
+  // Tool calls, tool results, cost, security, session events = interactive
+  if (event.type === "tool_call" || event.type === "tool_result" || event.type === "cost" ||
+      event.type === "security" || event.type === "budget_blocked" ||
+      event.type === "session_start" || event.type === "session_end" ||
+      event.type === "compaction") return "interactive";
   return "unknown";
 }
 
