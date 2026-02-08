@@ -25,20 +25,43 @@ export function registerCostHandler(
     return;
   }
 
-  // Try to import onDiagnosticEvent from the SDK at runtime
-  try {
-    const sdk = require("openclaw/plugin-sdk");
-    sdkOnDiagnosticEvent = sdk.onDiagnosticEvent;
-  } catch {
-    // Fallback: check api.runtime and globalThis
-    sdkOnDiagnosticEvent = api.runtime?.onDiagnosticEvent;
-    if (!sdkOnDiagnosticEvent) {
-      const g = globalThis as any;
-      if (typeof g.__openclaw_onDiagnosticEvent === "function") {
-        sdkOnDiagnosticEvent = g.__openclaw_onDiagnosticEvent;
-      }
+  // Resolve onDiagnosticEvent from the openclaw plugin-sdk
+  // The SDK is installed globally; plugins can't resolve it via normal require()
+  const resolveSDK = (): ((listener: (evt: any) => void) => () => void) | undefined => {
+    // Try normal require first
+    try { return require("openclaw/plugin-sdk").onDiagnosticEvent; } catch { /* noop */ }
+    // Try api.runtime
+    if (api.runtime?.onDiagnosticEvent) return api.runtime.onDiagnosticEvent;
+    // Try globalThis
+    if (typeof (globalThis as any).__openclaw_onDiagnosticEvent === "function") {
+      return (globalThis as any).__openclaw_onDiagnosticEvent;
     }
-  }
+    // Find openclaw installation and load SDK directly
+    try {
+      const path = require("path");
+      const fs = require("fs");
+      const candidates = [
+        // npm global
+        path.resolve(process.env.HOME || "", ".npm-global/lib/node_modules/openclaw/dist/plugin-sdk/index.js"),
+        // pnpm global
+        path.resolve(process.env.HOME || "", ".local/share/pnpm/global/5/node_modules/openclaw/dist/plugin-sdk/index.js"),
+        // system global
+        "/usr/local/lib/node_modules/openclaw/dist/plugin-sdk/index.js",
+        "/usr/lib/node_modules/openclaw/dist/plugin-sdk/index.js",
+        // relative to plugin
+        path.resolve(__dirname, "../../node_modules/openclaw/dist/plugin-sdk/index.js"),
+      ];
+      for (const c of candidates) {
+        if (fs.existsSync(c)) {
+          // Use eval to bypass TypeScript/bundler require rewriting
+          const mod = eval(`require(${JSON.stringify(c)})`);
+          if (typeof mod.onDiagnosticEvent === "function") return mod.onDiagnosticEvent;
+        }
+      }
+    } catch { /* noop */ }
+    return undefined;
+  };
+  sdkOnDiagnosticEvent = resolveSDK();
 
   if (!sdkOnDiagnosticEvent) {
     api.logger.error(
