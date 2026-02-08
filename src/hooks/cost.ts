@@ -20,7 +20,9 @@ export function registerCostHandler(
   config: PodwatchConfig,
   diagnosticsEnabled: boolean
 ): void {
+  console.log("[podwatch:debug] registerCostHandler() called, diagnosticsEnabled:", diagnosticsEnabled);
   if (!diagnosticsEnabled) {
+    console.log("[podwatch:debug] registerCostHandler() — skipping (diagnostics disabled)");
     api.logger.warn("[podwatch/cost] Diagnostics disabled — cost tracking inactive");
     return;
   }
@@ -62,6 +64,7 @@ export function registerCostHandler(
     return undefined;
   };
   sdkOnDiagnosticEvent = resolveSDK();
+  console.log("[podwatch:debug] sdkOnDiagnosticEvent resolved:", typeof sdkOnDiagnosticEvent);
 
   if (!sdkOnDiagnosticEvent) {
     api.logger.error(
@@ -71,10 +74,17 @@ export function registerCostHandler(
   }
 
   // Subscribe to diagnostic events
+  console.log("[podwatch:debug] Subscribing to diagnostic events...");
   const unsubscribe = sdkOnDiagnosticEvent((evt: DiagnosticEventPayload) => {
-    if (evt.type !== "model.usage") return;
+    console.log("[podwatch:debug] Diagnostic event received, type:", evt.type);
+    console.log("[podwatch:debug] Diagnostic event payload:", JSON.stringify(evt, null, 2)?.slice(0, 1000));
+    if (evt.type !== "model.usage") {
+      console.log("[podwatch:debug] Ignoring non-model.usage event:", evt.type);
+      return;
+    }
 
     const usage = evt as DiagnosticUsageEvent;
+    console.log("[podwatch:debug] model.usage event — provider:", usage.provider, "model:", usage.model, "costUsd:", usage.costUsd, "tokens:", usage.usage?.total);
 
     transmitter.enqueue({
       type: "cost",

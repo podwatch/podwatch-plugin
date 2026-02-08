@@ -22,12 +22,15 @@ let scanTimer: ReturnType<typeof setInterval> | null = null;
  * Register lifecycle hook handlers.
  */
 export function registerLifecycleHandlers(api: any, config: PodwatchConfig): void {
+  console.log("[podwatch:debug] registerLifecycleHandlers() called");
   // -----------------------------------------------------------------------
   // gateway_start — heartbeat + initial scan
   // -----------------------------------------------------------------------
   api.on(
     "gateway_start",
     async (event: GatewayStartEvent): Promise<void> => {
+      console.log("[podwatch:debug] === gateway_start ===");
+      console.log("[podwatch:debug] gateway_start event:", JSON.stringify(event, null, 2));
       // Send initial heartbeat
       sendHeartbeat();
 
@@ -64,6 +67,7 @@ export function registerLifecycleHandlers(api: any, config: PodwatchConfig): voi
   api.on(
     "gateway_stop",
     async (): Promise<void> => {
+      console.log("[podwatch:debug] === gateway_stop ===");
       // Stop intervals
       if (heartbeatTimer) {
         clearInterval(heartbeatTimer);
@@ -93,6 +97,9 @@ export function registerLifecycleHandlers(api: any, config: PodwatchConfig): voi
   api.on(
     "before_compaction",
     async (event: BeforeCompactionEvent, ctx: PluginHookAgentContext): Promise<void> => {
+      console.log("[podwatch:debug] === before_compaction ===");
+      console.log("[podwatch:debug] before_compaction event:", JSON.stringify(event, null, 2));
+      console.log("[podwatch:debug] before_compaction ctx:", JSON.stringify(ctx, null, 2));
       transmitter.enqueue({
         type: "compaction",
         ts: Date.now(),

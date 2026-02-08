@@ -19,12 +19,12 @@ Podwatch uses a "paste-a-prompt" installation flow:
 │  Copy this prompt and paste it into your agent chat: │
 │                                                      │
 │  ┌─────────────────────────────────────────────────┐ │
-│  │ Install Podwatch on this agent.                 │ │
+│  │ Install Podwatch monitoring on this agent.      │ │
 │  │ My API key is: pw_k8x7f...                      │ │
-│  │                                                 │ │
-│  │ Read the installer at                           │ │
-│  │ ~/.openclaw/skills/podwatch-installer/SKILL.md  │ │
-│  │ and follow every step exactly.                  │ │
+│  │ Use gateway config.patch to add the podwatch    │ │
+│  │ plugin config, then restart.                    │ │
+│  │ Full instructions at                            │ │
+│  │ https://podwatch.app/install                    │ │
 │  └─────────────────────────────────────────────────┘ │
 │                                        [📋 Copy]     │
 │                                                      │
@@ -34,25 +34,24 @@ Podwatch uses a "paste-a-prompt" installation flow:
 
 ## Distribution Options
 
-### Option A: Pre-installed Installer Skill (Recommended)
-User installs the lightweight installer skill first (via ClawHub or `openclaw skills install`),
-then the paste-a-prompt references the local SKILL.md.
+### Option A: Plugin Install (Recommended)
+User installs the Podwatch plugin via CLI, then configures via `gateway config.patch`.
 
 Prompt template:
 ```
-Install Podwatch on this agent. My API key is: {{API_KEY}}
-
-Read the installer at ~/.openclaw/skills/podwatch-installer/SKILL.md and follow every step.
+Install Podwatch monitoring on this agent. My API key is: {{API_KEY}}
+Use gateway config.patch to add the podwatch plugin config, then restart.
+Full instructions at https://podwatch.app/install
 ```
 
 ### Option B: Inline Prompt (No Pre-install)
-For users who don't want to install the skill first, the entire SKILL.md
-content is embedded in the prompt. Longer but zero-step.
+For users who want a single paste, the entire installation instructions
+are embedded in the prompt. Longer but zero-step. See INLINE-PROMPT.md.
 
 ### Option C: URL Reference (Future)
-When hosted, the SKILL.md can be fetched via URL:
+When hosted, the installer SKILL.md can be fetched via URL:
 ```
-Install Podwatch on this agent. My API key is: {{API_KEY}}
+Install Podwatch monitoring on this agent. My API key is: {{API_KEY}}
 
 Fetch the installer instructions from https://podwatch.app/install/skill.md and follow every step.
 ```
@@ -62,14 +61,14 @@ Fetch the installer instructions from https://podwatch.app/install/skill.md and 
 ### Local Test (for development)
 Paste this into your OpenClaw agent chat:
 ```
-Install Podwatch on this agent using the local installer skill at /home/rafa/podwatch-plugin/installer/SKILL.md — my API key is: pw_test_key_123
+Install Podwatch monitoring on this agent using the local installer at /home/rafa/podwatch-plugin/installer/SKILL.md — my API key is: pw_test_key_123
 ```
 
 ### Production Test
 ```
-Install Podwatch on this agent. My API key is: pw_live_key_xxx
-
-Read the installer at ~/.openclaw/skills/podwatch-installer/SKILL.md and follow every step.
+Install Podwatch monitoring on this agent. My API key is: pw_live_key_xxx
+Use gateway config.patch to add the podwatch plugin config, then restart.
+Full instructions at https://podwatch.app/install
 ```
 
 ## Files
