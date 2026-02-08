@@ -8,6 +8,8 @@
 import type { PodwatchConfig } from "../index.js";
 import type { DiagnosticUsageEvent, DiagnosticEventPayload } from "../types.js";
 import { transmitter } from "../transmitter.js";
+// Dynamic import at runtime — TypeScript can't resolve openclaw/plugin-sdk at build time
+let sdkOnDiagnosticEvent: ((listener: (evt: any) => void) => () => void) | undefined;
 
 /**
  * Register the cost handler.
@@ -23,23 +25,22 @@ export function registerCostHandler(
     return;
   }
 
-  // onDiagnosticEvent is available from openclaw/plugin-sdk at runtime
-  // or on the api.runtime object. Try both approaches.
-  let onDiagnosticEvent: ((listener: (evt: DiagnosticEventPayload) => void) => () => void) | undefined;
-
-  // Check api.runtime first (most reliable for plugins)
-  onDiagnosticEvent = api.runtime?.onDiagnosticEvent;
-
-  if (!onDiagnosticEvent) {
-    // At runtime, OpenClaw injects onDiagnosticEvent into the plugin environment.
-    // If it's not on api.runtime, try the global scope (some versions expose it there).
-    const g = globalThis as any;
-    if (typeof g.__openclaw_onDiagnosticEvent === "function") {
-      onDiagnosticEvent = g.__openclaw_onDiagnosticEvent;
+  // Try to import onDiagnosticEvent from the SDK at runtime
+  try {
+    const sdk = require("openclaw/plugin-sdk");
+    sdkOnDiagnosticEvent = sdk.onDiagnosticEvent;
+  } catch {
+    // Fallback: check api.runtime and globalThis
+    sdkOnDiagnosticEvent = api.runtime?.onDiagnosticEvent;
+    if (!sdkOnDiagnosticEvent) {
+      const g = globalThis as any;
+      if (typeof g.__openclaw_onDiagnosticEvent === "function") {
+        sdkOnDiagnosticEvent = g.__openclaw_onDiagnosticEvent;
+      }
     }
   }
 
-  if (!onDiagnosticEvent) {
+  if (!sdkOnDiagnosticEvent) {
     api.logger.error(
       "[podwatch/cost] Could not access onDiagnosticEvent. Cost tracking unavailable."
     );
@@ -47,7 +48,7 @@ export function registerCostHandler(
   }
 
   // Subscribe to diagnostic events
-  const unsubscribe = onDiagnosticEvent((evt: DiagnosticEventPayload) => {
+  const unsubscribe = sdkOnDiagnosticEvent((evt: DiagnosticEventPayload) => {
     if (evt.type !== "model.usage") return;
 
     const usage = evt as DiagnosticUsageEvent;
