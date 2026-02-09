@@ -28,10 +28,15 @@
         "description": "Monitor for suspicious tool patterns",
         "default": true
       },
+      "pulseIntervalMs": {
+        "type": "number",
+        "description": "Pulse alive-ping interval in milliseconds",
+        "default": 300000
+      },
       "heartbeatIntervalMs": {
         "type": "number",
-        "description": "Heartbeat interval in milliseconds",
-        "default": 60000
+        "description": "Deprecated — use pulseIntervalMs instead. Falls back to this if pulseIntervalMs not set.",
+        "default": 300000
       },
       "scanIntervalMs": {
         "type": "number",
@@ -46,7 +51,8 @@
     "endpoint": { "label": "API Endpoint" },
     "enableBudgetEnforcement": { "label": "Budget Enforcement" },
     "enableSecurityAlerts": { "label": "Security Alerts" },
-    "heartbeatIntervalMs": { "label": "Heartbeat Interval (ms)" },
+    "pulseIntervalMs": { "label": "Pulse Interval (ms)" },
+    "heartbeatIntervalMs": { "label": "Pulse Interval (ms) [deprecated]" },
     "scanIntervalMs": { "label": "Scan Interval (ms)" }
   },
   "requiresDiagnostics": true

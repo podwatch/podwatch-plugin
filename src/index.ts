@@ -7,7 +7,7 @@
  * - Tool latency + success/failure (after_tool_call)
  * - Session lifecycle (session_start, session_end)
  * - Context pressure (before_compaction)
- * - Heartbeat + skill/plugin scanning (gateway_start)
+ * - Pulse alive-ping + skill/plugin scanning (register())
  * - Graceful shutdown (gateway_stop)
  */
 
@@ -27,6 +27,9 @@ export interface PodwatchConfig {
   endpoint?: string;
   enableBudgetEnforcement?: boolean;
   enableSecurityAlerts?: boolean;
+  /** Pulse alive-ping interval in ms (default 300000 = 5 min). */
+  pulseIntervalMs?: number;
+  /** @deprecated Use pulseIntervalMs instead. Kept for backward compatibility. */
   heartbeatIntervalMs?: number;
   scanIntervalMs?: number;
 }
@@ -113,7 +116,8 @@ function resolveConfig(api: any): PodwatchConfig {
     endpoint: pluginConfig.endpoint ?? process.env.PODWATCH_ENDPOINT,
     enableBudgetEnforcement: pluginConfig.enableBudgetEnforcement ?? true,
     enableSecurityAlerts: pluginConfig.enableSecurityAlerts ?? true,
-    heartbeatIntervalMs: pluginConfig.heartbeatIntervalMs ?? 60_000,
+    // Backward compat: fall back to heartbeatIntervalMs if pulseIntervalMs not set
+    pulseIntervalMs: pluginConfig.pulseIntervalMs ?? pluginConfig.heartbeatIntervalMs ?? 300_000,
     scanIntervalMs: pluginConfig.scanIntervalMs ?? 21_600_000, // 6 hours
   };
 }

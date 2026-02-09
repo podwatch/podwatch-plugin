@@ -1,9 +1,12 @@
 /**
  * Lifecycle handlers — gateway_start, gateway_stop, before_compaction.
  *
- * gateway_start: starts heartbeat interval + initial skill/plugin scan
+ * register(): starts pulse interval + initial skill/plugin scan
  * gateway_stop: flushes pending events, stops intervals
  * before_compaction: tracks context window pressure
+ *
+ * Pulse = Podwatch plugin's lightweight alive-ping (direct HTTP, no LLM cost).
+ * This is NOT OpenClaw's agent heartbeat (which triggers LLM turns).
  */
 
 import type { PodwatchConfig } from "../index.js";
@@ -15,7 +18,7 @@ import type {
 import { transmitter } from "../transmitter.js";
 import { scanSkillsAndPlugins } from "../scanner.js";
 
-let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+let pulseTimer: ReturnType<typeof setInterval> | null = null;
 let scanTimer: ReturnType<typeof setInterval> | null = null;
 
 /**
@@ -24,20 +27,26 @@ let scanTimer: ReturnType<typeof setInterval> | null = null;
 export function registerLifecycleHandlers(api: any, config: PodwatchConfig): void {
   console.log("[podwatch:debug] registerLifecycleHandlers() called");
 
+  const endpoint = config.endpoint ?? "https://podwatch.app/api";
+  const apiKey = config.apiKey;
+
   // -----------------------------------------------------------------------
-  // Heartbeat + scan — run immediately during register() since
+  // Pulse + scan — run immediately during register() since
   // gateway_start is never emitted to plugins.
   // -----------------------------------------------------------------------
 
-  // Send initial heartbeat right now
-  console.log("[podwatch:debug] Starting heartbeat timer from register()");
-  sendHeartbeat();
+  // Send initial pulse right now
+  console.log("[podwatch:debug] Starting pulse timer from register()");
+  void sendPulse(endpoint, apiKey);
 
-  // Start heartbeat interval
-  if (heartbeatTimer) clearInterval(heartbeatTimer);
-  heartbeatTimer = setInterval(sendHeartbeat, config.heartbeatIntervalMs ?? 60_000);
-  if (heartbeatTimer && typeof heartbeatTimer === "object" && "unref" in heartbeatTimer) {
-    heartbeatTimer.unref();
+  // Start pulse interval (default 5 minutes)
+  if (pulseTimer) clearInterval(pulseTimer);
+  pulseTimer = setInterval(
+    () => void sendPulse(endpoint, apiKey),
+    config.pulseIntervalMs ?? 300_000
+  );
+  if (pulseTimer && typeof pulseTimer === "object" && "unref" in pulseTimer) {
+    pulseTimer.unref();
   }
 
   // Initial skill/plugin scan (fallback — also attempted in gateway_start)
@@ -56,7 +65,7 @@ export function registerLifecycleHandlers(api: any, config: PodwatchConfig): voi
   }
 
   api.logger.info(
-    `[podwatch/lifecycle] Heartbeat & scan started from register(). Heartbeat: ${config.heartbeatIntervalMs ?? 60_000}ms, Scan: ${config.scanIntervalMs ?? 21_600_000}ms`
+    `[podwatch/lifecycle] Pulse & scan started from register(). Pulse: ${config.pulseIntervalMs ?? 300_000}ms, Scan: ${config.scanIntervalMs ?? 21_600_000}ms`
   );
 
   // -----------------------------------------------------------------------
@@ -68,7 +77,7 @@ export function registerLifecycleHandlers(api: any, config: PodwatchConfig): voi
       console.log("[podwatch:debug] === gateway_start (best-effort) ===");
       console.log("[podwatch:debug] gateway_start event:", JSON.stringify(event, null, 2));
 
-      // Re-run scan as best-effort; heartbeat is already running
+      // Re-run scan as best-effort; pulse is already running
       void runScan(api.config?.agents?.defaults?.workspace);
     }
   );
@@ -81,9 +90,9 @@ export function registerLifecycleHandlers(api: any, config: PodwatchConfig): voi
     async (): Promise<void> => {
       console.log("[podwatch:debug] === gateway_stop ===");
       // Stop intervals
-      if (heartbeatTimer) {
-        clearInterval(heartbeatTimer);
-        heartbeatTimer = null;
+      if (pulseTimer) {
+        clearInterval(pulseTimer);
+        pulseTimer = null;
       }
       if (scanTimer) {
         clearInterval(scanTimer);
@@ -128,12 +137,33 @@ export function registerLifecycleHandlers(api: any, config: PodwatchConfig): voi
 // Helpers
 // ---------------------------------------------------------------------------
 
-function sendHeartbeat(): void {
-  transmitter.enqueue({
-    type: "heartbeat",
-    ts: Date.now(),
-    bufferedEvents: transmitter.bufferedCount,
-  });
+/**
+ * Send a lightweight pulse directly to the Podwatch API.
+ * This bypasses the transmitter/events pipeline entirely —
+ * pulses go to their own dedicated endpoint.
+ */
+async function sendPulse(endpoint: string, apiKey: string): Promise<void> {
+  try {
+    const response = await fetch(`${endpoint}/pulse`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        ts: Date.now(),
+        bufferedEvents: transmitter.bufferedCount,
+        uptimeHours: transmitter.getAgentUptimeHours(),
+        pluginVersion: "0.1.0",
+      }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!response.ok) {
+      console.error(`[podwatch/pulse] API ${response.status}`);
+    }
+  } catch (err) {
+    console.error("[podwatch/pulse] Failed:", err);
+  }
 }
 
 async function runScan(workspaceDir?: string): Promise<void> {
