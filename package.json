@@ -1,19 +1,27 @@
 {
-  "name": "@podwatch/podwatch",
-  "version": "0.1.0",
+  "name": "podwatch",
+  "version": "1.0.0",
   "description": "Cost monitoring, budget enforcement, and security alerts for OpenClaw agents",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "bin": {
+    "podwatch": "./bin/podwatch.js"
+  },
   "files": [
     "dist/",
     "skills/",
-    "openclaw.plugin.json"
+    "openclaw.plugin.json",
+    "bin/",
+    "lib/"
   ],
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
     "clean": "rm -rf dist",
     "prepublishOnly": "npm run build"
+  },
+  "engines": {
+    "node": ">=16.0.0"
   },
   "openclaw": {
     "plugin": true,
