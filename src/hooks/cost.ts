@@ -14,14 +14,21 @@
 import type { PodwatchConfig } from "../index.js";
 import { transmitter } from "../transmitter.js";
 
-// Track how far into event.messages we've already processed
-let lastSeenIndex = 0;
+// Track how far into event.messages we've already processed — per session
+const lastSeenIndexMap = new Map<string, number>();
 
 /**
- * Reset dedup state (exported for testing).
+ * Reset all dedup state (exported for testing).
  */
 export function _resetCostState(): void {
-  lastSeenIndex = 0;
+  lastSeenIndexMap.clear();
+}
+
+/**
+ * Clear a single session's index (call on session_end to prevent memory leaks).
+ */
+export function _clearSessionIndex(sessionKey: string): void {
+  lastSeenIndexMap.delete(sessionKey);
 }
 
 /**
@@ -36,9 +43,19 @@ export function registerCostHandler(
   api.on("before_agent_start", async (event: any, ctx: any) => {
     if (!event?.messages || !Array.isArray(event.messages)) return;
 
+    const sessionKey: string = ctx?.sessionKey ?? "__default__";
+
+    // Get per-session index (defaults to 0 for new sessions)
+    let lastSeenIndex = lastSeenIndexMap.get(sessionKey) ?? 0;
+
+    // Bounds check: if messages were compacted, reset to 0
+    if (lastSeenIndex > event.messages.length) {
+      lastSeenIndex = 0;
+    }
+
     // Only process new messages since last invocation
     const newMessages = event.messages.slice(lastSeenIndex);
-    lastSeenIndex = event.messages.length;
+    lastSeenIndexMap.set(sessionKey, event.messages.length);
 
     if (newMessages.length === 0) return;
 
@@ -85,6 +102,14 @@ export function registerCostHandler(
         // Tag heartbeat-triggered cost events so the dashboard can distinguish them
         ...(isHeartbeat ? { sessionType: "heartbeat" } : {}),
       });
+    }
+  });
+
+  // Clean up session index on session end to prevent memory leaks
+  api.on("session_end", async (_event: any, ctx: any) => {
+    const sessionKey: string = ctx?.sessionKey;
+    if (sessionKey) {
+      lastSeenIndexMap.delete(sessionKey);
     }
   });
 

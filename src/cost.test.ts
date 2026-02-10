@@ -17,7 +17,7 @@ vi.mock("./transmitter.js", () => {
   };
 });
 
-import { registerCostHandler, _resetCostState } from "./hooks/cost.js";
+import { registerCostHandler, _resetCostState, _clearSessionIndex } from "./hooks/cost.js";
 import { transmitter } from "./transmitter.js";
 
 function getEnqueued(): any[] {
@@ -177,6 +177,117 @@ describe("cost handler — costBreakdown field", () => {
     const events = getEnqueued();
     expect(events).toHaveLength(1);
     expect(events[0].costBreakdown).toBeUndefined();
+  });
+});
+
+describe("cost handler — per-session dedup (multi-session)", () => {
+  beforeEach(() => {
+    _resetCostState();
+    resetEnqueued();
+  });
+
+  it("tracks lastSeenIndex independently per session", async () => {
+    const api = makeApi();
+    registerCostHandler(api, { apiKey: "test" }, true);
+
+    // Session A: 10 messages
+    const msgsA = makeMessages(10, 1000);
+    await api._trigger("before_agent_start", { messages: msgsA }, { sessionKey: "session-a" });
+    expect(getEnqueued()).toHaveLength(10);
+    resetEnqueued();
+
+    // Session B: 5 messages — should NOT be affected by session A's index
+    const msgsB = makeMessages(5, 2000);
+    await api._trigger("before_agent_start", { messages: msgsB }, { sessionKey: "session-b" });
+    expect(getEnqueued()).toHaveLength(5);
+  });
+
+  it("session A (10 msgs) then session B (5 msgs) — B costs NOT empty", async () => {
+    const api = makeApi();
+    registerCostHandler(api, { apiKey: "test" }, true);
+
+    // Process session A first
+    await api._trigger("before_agent_start", { messages: makeMessages(10, 1000) }, { sessionKey: "a" });
+    expect(getEnqueued()).toHaveLength(10);
+    resetEnqueued();
+
+    // Process session B — previously this would slice(10) on a 5-element array → empty
+    await api._trigger("before_agent_start", { messages: makeMessages(5, 2000) }, { sessionKey: "b" });
+    expect(getEnqueued()).toHaveLength(5);
+  });
+
+  it("alternating sessions both track correctly", async () => {
+    const api = makeApi();
+    registerCostHandler(api, { apiKey: "test" }, true);
+
+    const msgsA1 = makeMessages(3, 1000);
+    const msgsB1 = makeMessages(2, 2000);
+
+    // A: 3 msgs
+    await api._trigger("before_agent_start", { messages: msgsA1 }, { sessionKey: "a" });
+    expect(getEnqueued()).toHaveLength(3);
+    resetEnqueued();
+
+    // B: 2 msgs
+    await api._trigger("before_agent_start", { messages: msgsB1 }, { sessionKey: "b" });
+    expect(getEnqueued()).toHaveLength(2);
+    resetEnqueued();
+
+    // A grows to 5 msgs — only 2 new
+    const msgsA2 = [...msgsA1, ...makeMessages(2, 3000)];
+    await api._trigger("before_agent_start", { messages: msgsA2 }, { sessionKey: "a" });
+    expect(getEnqueued()).toHaveLength(2);
+    resetEnqueued();
+
+    // B grows to 4 msgs — only 2 new
+    const msgsB2 = [...msgsB1, ...makeMessages(2, 4000)];
+    await api._trigger("before_agent_start", { messages: msgsB2 }, { sessionKey: "b" });
+    expect(getEnqueued()).toHaveLength(2);
+  });
+
+  it("session_end clears that session's index", async () => {
+    const api = makeApi();
+    registerCostHandler(api, { apiKey: "test" }, true);
+
+    // Process session A
+    const msgsA = makeMessages(5, 1000);
+    await api._trigger("before_agent_start", { messages: msgsA }, { sessionKey: "sess-1" });
+    expect(getEnqueued()).toHaveLength(5);
+    resetEnqueued();
+
+    // Simulate session end — should clear the index for sess-1
+    _clearSessionIndex("sess-1");
+
+    // Same session starts fresh — all 5 should be processed again
+    await api._trigger("before_agent_start", { messages: msgsA }, { sessionKey: "sess-1" });
+    expect(getEnqueued()).toHaveLength(5);
+  });
+
+  it("new session starts fresh with index 0", async () => {
+    const api = makeApi();
+    registerCostHandler(api, { apiKey: "test" }, true);
+
+    // Process session A
+    await api._trigger("before_agent_start", { messages: makeMessages(10, 1000) }, { sessionKey: "a" });
+    resetEnqueued();
+
+    // Brand new session C — never seen before — should start at 0
+    await api._trigger("before_agent_start", { messages: makeMessages(3, 5000) }, { sessionKey: "c" });
+    expect(getEnqueued()).toHaveLength(3);
+  });
+
+  it("handles compaction — resets index when messages.length < lastSeenIndex", async () => {
+    const api = makeApi();
+    registerCostHandler(api, { apiKey: "test" }, true);
+
+    // Process 10 messages
+    await api._trigger("before_agent_start", { messages: makeMessages(10, 1000) }, { sessionKey: "s1" });
+    resetEnqueued();
+
+    // After compaction, messages array is smaller — should reset and reprocess all
+    const compactedMsgs = makeMessages(3, 5000);
+    await api._trigger("before_agent_start", { messages: compactedMsgs }, { sessionKey: "s1" });
+    expect(getEnqueued()).toHaveLength(3);
   });
 });
 
