@@ -44,6 +44,22 @@ export interface PodwatchConfig {
 const DEBUG = !!process.env.PODWATCH_DEBUG;
 
 /**
+ * Redact sensitive fields from an object for safe debug logging.
+ * Returns a shallow copy with secret values replaced by '***'.
+ */
+function redactForLog(obj: Record<string, unknown>): Record<string, unknown> {
+  if (!obj || typeof obj !== "object") return obj;
+  const SENSITIVE_KEYS = ["apiKey", "apiSecret", "secret", "token", "password", "key"];
+  const redacted: Record<string, unknown> = { ...obj };
+  for (const k of SENSITIVE_KEYS) {
+    if (k in redacted && redacted[k]) {
+      redacted[k] = "***";
+    }
+  }
+  return redacted;
+}
+
+/**
  * OpenClaw plugin entry point.
  * Called by the Gateway when the plugin is loaded.
  */
@@ -51,14 +67,18 @@ export default function register(api: any): void {
   if (DEBUG) {
     console.log("[podwatch:debug] register() called");
     console.log("[podwatch:debug] api object keys:", Object.keys(api));
-    console.log("[podwatch:debug] api.config:", JSON.stringify(api.config, null, 2)?.slice(0, 500));
-    console.log("[podwatch:debug] api.pluginConfig:", JSON.stringify(api.pluginConfig, null, 2));
+    // Log only safe gateway config fields — never dump the full api.config
+    const safeConfigKeys = api.config
+      ? { diagnostics: api.config.diagnostics, agents: api.config.agents ? "(present)" : "(absent)" }
+      : "(undefined)";
+    console.log("[podwatch:debug] api.config (safe fields):", JSON.stringify(safeConfigKeys, null, 2));
+    console.log("[podwatch:debug] api.pluginConfig:", JSON.stringify(redactForLog(api.pluginConfig ?? {}), null, 2));
     console.log("[podwatch:debug] api.runtime keys:", api.runtime ? Object.keys(api.runtime) : "undefined");
   }
 
   const config = resolveConfig(api);
   if (DEBUG) {
-    console.log("[podwatch:debug] Resolved config:", JSON.stringify(config, null, 2));
+    console.log("[podwatch:debug] Resolved config:", JSON.stringify(redactForLog(config as any), null, 2));
   }
 
   if (!config.apiKey) {
@@ -117,7 +137,7 @@ export default function register(api: any): void {
 function resolveConfig(api: any): PodwatchConfig {
   const pluginConfig = api.pluginConfig ?? {};
   if (DEBUG) {
-    console.log("[podwatch:debug] resolveConfig() — raw pluginConfig:", JSON.stringify(pluginConfig, null, 2));
+    console.log("[podwatch:debug] resolveConfig() — raw pluginConfig:", JSON.stringify(redactForLog(pluginConfig), null, 2));
     console.log("[podwatch:debug] resolveConfig() — env PODWATCH_API_KEY set:", !!process.env.PODWATCH_API_KEY);
     console.log("[podwatch:debug] resolveConfig() — env PODWATCH_ENDPOINT:", process.env.PODWATCH_ENDPOINT ?? "(unset)");
   }

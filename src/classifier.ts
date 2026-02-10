@@ -97,9 +97,23 @@ export function classifyTool(
 
   return {
     accessesCredentials: checkAccessesCredentials(name, params),
-    makesNetworkCall: checkMakesNetworkCall(name),
+    makesNetworkCall: checkMakesNetworkCall(name, params),
     persistenceAttempt: checkPersistenceAttempt(name, params),
   };
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/** Extract command string from exec-like tool params. */
+function extractCommand(params: Record<string, unknown>): string {
+  return (
+    (typeof params.command === "string" && params.command) ||
+    (typeof params.cmd === "string" && params.cmd) ||
+    (typeof params.script === "string" && params.script) ||
+    ""
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -110,25 +124,67 @@ function checkAccessesCredentials(
   toolName: string,
   params: Record<string, unknown>
 ): boolean {
-  // Only check file-reading tools
-  if (toolName !== "read" && toolName !== "read_file" && toolName !== "cat") {
-    return false;
+  // Direct file-reading tools: check path params
+  if (toolName === "read" || toolName === "read_file" || toolName === "cat") {
+    const filePath =
+      (typeof params.path === "string" && params.path) ||
+      (typeof params.file_path === "string" && params.file_path) ||
+      (typeof params.file === "string" && params.file) ||
+      "";
+
+    if (!filePath) return false;
+    return CREDENTIAL_FILE_PATTERNS.some((pattern) => pattern.test(filePath));
   }
 
-  // Check file path params
-  const filePath =
-    (typeof params.path === "string" && params.path) ||
-    (typeof params.file_path === "string" && params.file_path) ||
-    (typeof params.file === "string" && params.file) ||
-    "";
+  // Exec-like tools: parse command for credential file paths
+  // Check each token/word individually since patterns use anchors (e.g. \.env$)
+  if (EXEC_TOOLS.has(toolName)) {
+    const command = extractCommand(params);
+    if (!command) return false;
+    // Split on whitespace; also strip common prefixes like @ (curl's file ref)
+    const tokens = command.split(/\s+/).map((t) => t.replace(/^[@<>]+/, ""));
+    return tokens.some((token) =>
+      CREDENTIAL_FILE_PATTERNS.some((pattern) => pattern.test(token))
+    );
+  }
 
-  if (!filePath) return false;
-
-  return CREDENTIAL_FILE_PATTERNS.some((pattern) => pattern.test(filePath));
+  return false;
 }
 
-function checkMakesNetworkCall(toolName: string): boolean {
-  return NETWORK_TOOLS.has(toolName);
+// Network tool names that may appear as commands inside exec
+const EXEC_NETWORK_COMMANDS = [
+  "curl",
+  "wget",
+  "nc",
+  "ncat",
+  "ssh",
+  "scp",
+  "rsync",
+  "fetch",
+  "http",    // httpie
+  "httpie",
+];
+
+function checkMakesNetworkCall(
+  toolName: string,
+  params: Record<string, unknown>
+): boolean {
+  // Direct network tools
+  if (NETWORK_TOOLS.has(toolName)) return true;
+
+  // Exec-like tools: parse command for network tool invocations
+  if (EXEC_TOOLS.has(toolName)) {
+    const command = extractCommand(params);
+    if (!command) return false;
+    const lower = command.toLowerCase();
+    return EXEC_NETWORK_COMMANDS.some((cmd) => {
+      // Match as a standalone word (start of command, after pipe, after &&, etc.)
+      const re = new RegExp(`(?:^|[|;&\\s])${cmd}(?:\\s|$)`);
+      return re.test(lower);
+    });
+  }
+
+  return false;
 }
 
 function checkPersistenceAttempt(
@@ -137,12 +193,7 @@ function checkPersistenceAttempt(
 ): boolean {
   if (!EXEC_TOOLS.has(toolName)) return false;
 
-  const command =
-    (typeof params.command === "string" && params.command) ||
-    (typeof params.cmd === "string" && params.cmd) ||
-    (typeof params.script === "string" && params.script) ||
-    "";
-
+  const command = extractCommand(params);
   if (!command) return false;
 
   const lower = command.toLowerCase();
