@@ -57,7 +57,7 @@ interface CachedBudget {
 
 let cachedBudget: CachedBudget | null = null;
 let budgetSyncTimer: ReturnType<typeof setInterval> | null = null;
-const BUDGET_SYNC_INTERVAL_MS = 60_000;
+const BUDGET_SYNC_INTERVAL_MS = 300_000; // 5 minutes — acceptable with 95% tolerance buffer
 
 // ---------------------------------------------------------------------------
 // Audit log for dropped events
@@ -384,13 +384,56 @@ async function doFlush(): Promise<void> {
 // ---------------------------------------------------------------------------
 
 /**
- * Budget sync is currently disabled — the dashboard API does not yet expose
- * a /api/budget endpoint (returns 404). Budget enforcement will use locally
- * cached state only. TODO: Re-enable once the dashboard ships the budget API.
+ * Sync budget from dashboard API. Called on activate + every 300s.
+ * Stale by up to 5 min — acceptable with 95% tolerance buffer.
+ * Gracefully handles 404 (endpoint not deployed yet) without spamming logs.
  */
+let budgetSyncFailures = 0;
+const BUDGET_SYNC_MAX_SILENT_FAILURES = 3; // Only warn after N consecutive failures
+
 async function syncBudget(): Promise<void> {
-  // No-op: /api/budget endpoint not available yet.
-  // When the endpoint is ready, restore the fetch call here.
+  if (!config) return;
+
+  try {
+    const response = await fetch(`${config.endpoint}/budget`, {
+      method: "GET",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${config.apiKey}`,
+      },
+      signal: AbortSignal.timeout(10_000),
+    });
+
+    if (response.ok) {
+      const data = (await response.json()) as { limit?: number; currentSpend?: number };
+      cachedBudget = {
+        limit: typeof data.limit === "number" ? data.limit : 0,
+        currentSpend: typeof data.currentSpend === "number" ? data.currentSpend : 0,
+        lastSyncTs: Date.now(),
+      };
+      budgetSyncFailures = 0;
+      return;
+    }
+
+    // 404 — endpoint not deployed yet, silently ignore
+    if (response.status === 404) {
+      budgetSyncFailures++;
+      if (budgetSyncFailures === BUDGET_SYNC_MAX_SILENT_FAILURES) {
+        console.warn("[podwatch] Budget endpoint not available (404). Budget sync disabled until endpoint is deployed.");
+      }
+      return;
+    }
+
+    budgetSyncFailures++;
+    if (budgetSyncFailures <= BUDGET_SYNC_MAX_SILENT_FAILURES) {
+      console.warn(`[podwatch] Budget sync failed: HTTP ${response.status}`);
+    }
+  } catch (err) {
+    budgetSyncFailures++;
+    if (budgetSyncFailures <= BUDGET_SYNC_MAX_SILENT_FAILURES) {
+      console.warn("[podwatch] Budget sync network error:", err);
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -408,6 +451,7 @@ export const transmitter = {
     knownTools.clear();
     recentCredentialAccesses.length = 0;
     cachedBudget = null;
+    budgetSyncFailures = 0;
 
     if (flushTimer) clearInterval(flushTimer);
     flushTimer = setInterval(() => void doFlush(), config.flushIntervalMs);
