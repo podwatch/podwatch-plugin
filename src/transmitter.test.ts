@@ -7,6 +7,15 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 vi.mock("node:fs", () => ({
   appendFileSync: vi.fn(),
   mkdirSync: vi.fn(),
+  statSync: vi.fn(() => { throw new Error("ENOENT"); }),
+  readFileSync: vi.fn((filePath: string) => {
+    if (typeof filePath === "string" && filePath.endsWith("package.json")) {
+      return JSON.stringify({ version: "1.0.1" });
+    }
+    return "";
+  }),
+  writeFileSync: vi.fn(),
+  chmodSync: vi.fn(),
 }));
 vi.mock("node:path", async () => {
   const actual = await vi.importActual<typeof import("node:path")>("node:path");
@@ -393,5 +402,130 @@ describe("transmitter — alert event mapping", () => {
     });
 
     expect(transmitter.bufferedCount).toBe(1);
+  });
+});
+
+describe("transmitter — M1: plugin version from package.json", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // Reset readFileSync to return package.json for version reads
+    (fs.readFileSync as any).mockImplementation((filePath: string) => {
+      if (typeof filePath === "string" && filePath.endsWith("package.json")) {
+        return JSON.stringify({ version: "1.0.1" });
+      }
+      return "";
+    });
+    // Default: file doesn't exist (no rotation needed)
+    (fs.statSync as any).mockImplementation(() => { throw new Error("ENOENT"); });
+    transmitter.start({
+      apiKey: "test-key",
+      endpoint: "https://podwatch.app/api",
+      batchSize: 50,
+      flushIntervalMs: 999_999,
+    });
+  });
+
+  afterEach(() => {
+    transmitter.stop();
+    globalThis.fetch = originalFetch;
+  });
+
+  it("sends skillVersion from package.json (not hardcoded 0.1.0)", async () => {
+    mockFetch(200);
+    transmitter.enqueue({ type: "cost", ts: Date.now() });
+    await transmitter.flush();
+
+    const call = (globalThis.fetch as any).mock.calls[0];
+    const body = JSON.parse(call[1].body);
+    // Must match package.json version, not hardcoded "0.1.0"
+    expect(body.skillVersion).toBe("1.0.1");
+    expect(body.skillVersion).not.toBe("0.1.0");
+  });
+});
+
+describe("transmitter — M3: audit log rotation and permissions", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // Reset readFileSync to return package.json for version reads
+    (fs.readFileSync as any).mockImplementation((filePath: string) => {
+      if (typeof filePath === "string" && filePath.endsWith("package.json")) {
+        return JSON.stringify({ version: "1.0.1" });
+      }
+      return "";
+    });
+    // Default: file doesn't exist (no rotation needed)
+    (fs.statSync as any).mockImplementation(() => { throw new Error("ENOENT"); });
+    transmitter.start({
+      apiKey: "test-key",
+      endpoint: "https://podwatch.app/api",
+      batchSize: 50,
+      flushIntervalMs: 999_999,
+    });
+  });
+
+  afterEach(() => {
+    transmitter.stop();
+    globalThis.fetch = originalFetch;
+  });
+
+  it("sets file permissions to 0o600 on audit log write", async () => {
+    mockFetch(400); // triggers audit log write
+    transmitter.enqueue({ type: "cost", ts: Date.now() });
+    await transmitter.flush();
+
+    expect(fs.chmodSync).toHaveBeenCalledWith(
+      expect.stringContaining("audit.log"),
+      0o600
+    );
+  });
+
+  it("rotates audit log when it exceeds 1MB", async () => {
+    // Simulate a 1.1MB audit log file
+    (fs.statSync as any).mockReturnValue({ size: 1_100_000 });
+    const bigContent = "A".repeat(500_000) + "\n" + "B".repeat(500_000) + "\n";
+    (fs.readFileSync as any).mockImplementation((filePath: string) => {
+      if (typeof filePath === "string" && filePath.endsWith("package.json")) {
+        return JSON.stringify({ version: "1.0.1" });
+      }
+      return bigContent;
+    });
+
+    mockFetch(400); // triggers audit log write
+    transmitter.enqueue({ type: "cost", ts: Date.now() });
+    await transmitter.flush();
+
+    // writeFileSync should have been called to truncate
+    expect(fs.writeFileSync).toHaveBeenCalledWith(
+      expect.stringContaining("audit.log"),
+      expect.any(String),
+      { mode: 0o600 }
+    );
+
+    // The written content should be shorter than the original
+    const truncatedContent = (fs.writeFileSync as any).mock.calls[0][1];
+    expect(truncatedContent.length).toBeLessThan(bigContent.length);
+  });
+
+  it("does NOT rotate when audit log is under 1MB", async () => {
+    (fs.statSync as any).mockReturnValue({ size: 500_000 }); // 500KB — under limit
+
+    mockFetch(400); // triggers audit log write
+    transmitter.enqueue({ type: "cost", ts: Date.now() });
+    await transmitter.flush();
+
+    // writeFileSync should NOT be called (no rotation needed)
+    expect(fs.writeFileSync).not.toHaveBeenCalled();
+
+    // But appendFileSync should still be called (normal write)
+    expect(fs.appendFileSync).toHaveBeenCalled();
+  });
+
+  it("appendFileSync is called with mode 0o600", async () => {
+    mockFetch(400); // triggers audit log write
+    transmitter.enqueue({ type: "cost", ts: Date.now() });
+    await transmitter.flush();
+
+    const appendCall = (fs.appendFileSync as any).mock.calls[0];
+    expect(appendCall[2]).toEqual({ mode: 0o600 });
   });
 });

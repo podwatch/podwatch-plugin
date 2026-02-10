@@ -17,6 +17,14 @@ import type {
 } from "../types.js";
 import { transmitter } from "../transmitter.js";
 import { scanSkillsAndPlugins } from "../scanner.js";
+import * as fs from "node:fs";
+import * as path from "node:path";
+
+const PLUGIN_VERSION: string = (
+  JSON.parse(
+    fs.readFileSync(path.join(__dirname, "..", "..", "package.json"), "utf-8")
+  ) as { version: string }
+).version;
 
 let pulseTimer: ReturnType<typeof setTimeout> | null = null;
 let scanTimer: ReturnType<typeof setInterval> | null = null;
@@ -173,7 +181,7 @@ async function sendPulseWithBackoff(
         ts: Date.now(),
         bufferedEvents: transmitter.bufferedCount,
         uptimeHours: transmitter.getAgentUptimeHours(),
-        pluginVersion: "0.1.0",
+        pluginVersion: PLUGIN_VERSION,
       }),
       signal: AbortSignal.timeout(10_000),
     });

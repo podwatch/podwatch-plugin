@@ -11,7 +11,7 @@
  * - Graceful shutdown (gateway_stop)
  */
 
-import type { PluginHookName } from "./types.js";
+import type { PluginHookName, PluginApi } from "./types.js";
 import { registerCostHandler } from "./hooks/cost.js";
 import { registerSecurityHandlers } from "./hooks/security.js";
 import { registerSessionHandlers } from "./hooks/sessions.js";
@@ -63,7 +63,7 @@ function redactForLog(obj: Record<string, unknown>): Record<string, unknown> {
  * OpenClaw plugin entry point.
  * Called by the Gateway when the plugin is loaded.
  */
-export default function register(api: any): void {
+export default function register(api: PluginApi): void {
   if (DEBUG) {
     console.log("[podwatch:debug] register() called");
     console.log("[podwatch:debug] api object keys:", Object.keys(api));
@@ -134,7 +134,7 @@ export default function register(api: any): void {
 // Config resolution
 // ---------------------------------------------------------------------------
 
-function resolveConfig(api: any): PodwatchConfig {
+function resolveConfig(api: PluginApi): PodwatchConfig {
   const pluginConfig = api.pluginConfig ?? {};
   if (DEBUG) {
     console.log("[podwatch:debug] resolveConfig() — raw pluginConfig:", JSON.stringify(redactForLog(pluginConfig), null, 2));

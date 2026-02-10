@@ -17,6 +17,12 @@ import type { TransmitterConfig, PodwatchEvent } from "./types.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
+// Read version from package.json at build time (resolveJsonModule enabled)
+const PLUGIN_VERSION: string = (
+  JSON.parse(
+    fs.readFileSync(path.join(__dirname, "..", "package.json"), "utf-8")
+  ) as { version: string }
+).version;
 
 // ---------------------------------------------------------------------------
 // State
@@ -32,8 +38,6 @@ const MAX_BACKOFF_MS = 30_000;
 const MAX_RETRIES = 10;
 const MAX_BUFFER_SIZE = 1_000;
 const BUFFER_TARGET_SIZE = 900;
-const PLUGIN_VERSION = "0.1.0";
-
 // --- Trial expired flag ---
 let trialExpired = false;
 
@@ -71,17 +75,40 @@ function getAuditLogPath(): string {
   return path.join(os.homedir(), ".openclaw", "extensions", "podwatch", "audit.log");
 }
 
+const AUDIT_LOG_MAX_BYTES = 1_048_576; // 1 MB
+
 function writeAuditLog(reason: string, eventCount: number, events: PodwatchEvent[]): void {
   try {
-    const logDir = path.dirname(getAuditLogPath());
+    const logPath = getAuditLogPath();
+    const logDir = path.dirname(logPath);
     fs.mkdirSync(logDir, { recursive: true });
+
+    // Enforce size cap — rotate if at or over 1 MB
+    try {
+      const stats = fs.statSync(logPath);
+      if (stats.size >= AUDIT_LOG_MAX_BYTES) {
+        // Truncate: keep the last ~half of the file
+        const content = fs.readFileSync(logPath, "utf-8");
+        const half = Math.floor(content.length / 2);
+        // Find the first newline after the midpoint to avoid partial lines
+        const cutIdx = content.indexOf("\n", half);
+        const trimmed = cutIdx >= 0 ? content.slice(cutIdx + 1) : "";
+        fs.writeFileSync(logPath, trimmed, { mode: 0o600 });
+      }
+    } catch {
+      // File may not exist yet — that's fine, appendFileSync will create it
+    }
+
     const entry = JSON.stringify({
       ts: new Date().toISOString(),
       reason,
       eventCount,
       eventTypes: events.map((e) => e.type),
     });
-    fs.appendFileSync(getAuditLogPath(), entry + "\n");
+    fs.appendFileSync(logPath, entry + "\n", { mode: 0o600 });
+
+    // Ensure file permissions are 0o600 (owner read/write only)
+    fs.chmodSync(logPath, 0o600);
   } catch {
     // Best-effort — don't crash the plugin over audit logging
   }

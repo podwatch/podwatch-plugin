@@ -120,3 +120,35 @@ export interface PodwatchEvent {
 }
 
 // (RiskLevel removed — classification moved to server side)
+
+// ---------------------------------------------------------------------------
+// Plugin API interface (minimal typing without importing full SDK)
+// ---------------------------------------------------------------------------
+
+export interface PluginLogger {
+  info: (...args: unknown[]) => void;
+  warn: (...args: unknown[]) => void;
+  error: (...args: unknown[]) => void;
+}
+
+export interface PluginApi {
+  /** Subscribe to a hook event. */
+  on: (event: PluginHookName | string, handler: (...args: unknown[]) => void | Promise<void>) => void;
+  /** Structured logger provided by the gateway. */
+  logger: PluginLogger;
+  /** Full gateway config (agents, diagnostics, etc.). Typed loosely for nested access. */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  config: Record<string, any>;
+  /** Plugin-specific config from openclaw.json `plugins.entries.<name>.config`. */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  pluginConfig: Record<string, any>;
+  /** Plugin version string from package.json (passed by the gateway). */
+  version: string;
+  /** Subscribe to diagnostic events (model.usage, etc.). Returns unsubscribe fn. */
+  onDiagnosticEvent?: (handler: (event: DiagnosticEventPayload) => void) => () => void;
+  /** Runtime information (optional, may not be present in all gateway versions). */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  runtime?: Record<string, any>;
+  /** Allow additional properties from the gateway. */
+  [key: string]: unknown;
+}
