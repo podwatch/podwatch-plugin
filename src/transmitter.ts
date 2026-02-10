@@ -49,6 +49,7 @@ const CREDENTIAL_ACCESS_WINDOW_MS = 60_000; // 60 seconds
 
 // --- Known tools tracking ---
 const knownTools = new Set<string>();
+const KNOWN_TOOLS_MAX_SIZE = 10_000;
 let activateTs = 0; // when the plugin started
 
 // --- Budget cache ---
@@ -597,9 +598,16 @@ export const transmitter = {
     return knownTools.has(toolName);
   },
 
-  /** Record a tool as seen. */
+  /** Record a tool as seen. Clears the set when it exceeds KNOWN_TOOLS_MAX_SIZE. */
   recordToolSeen(toolName: string): void {
     knownTools.add(toolName);
+    if (knownTools.size > KNOWN_TOOLS_MAX_SIZE) {
+      console.warn(
+        `[podwatch] knownTools set exceeded ${KNOWN_TOOLS_MAX_SIZE} entries — resetting first-time-tool baseline`
+      );
+      knownTools.clear();
+      knownTools.add(toolName);
+    }
   },
 
   /** Get agent uptime in hours since plugin activated. */

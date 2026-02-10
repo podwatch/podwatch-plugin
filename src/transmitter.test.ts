@@ -261,6 +261,97 @@ describe("transmitter", () => {
   });
 });
 
+describe("transmitter — knownTools set cap", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    transmitter.start({
+      apiKey: "test-key",
+      endpoint: "https://podwatch.app/api",
+      batchSize: 50,
+      flushIntervalMs: 999_999,
+    });
+  });
+
+  afterEach(() => {
+    transmitter.stop();
+    globalThis.fetch = originalFetch;
+  });
+
+  it("caps knownTools at 10,000 entries", () => {
+    // Fill to 10,000
+    for (let i = 0; i < 10_000; i++) {
+      transmitter.recordToolSeen(`tool-${i}`);
+    }
+    expect(transmitter.knownToolCount).toBe(10_000);
+
+    // Adding one more should trigger a reset
+    transmitter.recordToolSeen("tool-overflow");
+    // After reset, only the new tool should be in the set
+    expect(transmitter.knownToolCount).toBeLessThanOrEqual(1);
+  });
+
+  it("clears the set entirely when cap is exceeded", () => {
+    for (let i = 0; i < 10_000; i++) {
+      transmitter.recordToolSeen(`tool-${i}`);
+    }
+
+    // Previously known tools should be recognized
+    expect(transmitter.isKnownTool("tool-0")).toBe(true);
+
+    // Trigger reset
+    transmitter.recordToolSeen("tool-overflow");
+
+    // Old tools are no longer known (set was cleared)
+    expect(transmitter.isKnownTool("tool-0")).toBe(false);
+    // But the overflow tool IS known (re-added after clear)
+    expect(transmitter.isKnownTool("tool-overflow")).toBe(true);
+  });
+
+  it("logs a warning when knownTools set is reset", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    for (let i = 0; i < 10_000; i++) {
+      transmitter.recordToolSeen(`tool-${i}`);
+    }
+
+    // Trigger reset
+    transmitter.recordToolSeen("tool-overflow");
+
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("knownTools")
+    );
+    warnSpy.mockRestore();
+  });
+
+  it("works normally below the cap", () => {
+    transmitter.recordToolSeen("tool-a");
+    transmitter.recordToolSeen("tool-b");
+    transmitter.recordToolSeen("tool-c");
+
+    expect(transmitter.knownToolCount).toBe(3);
+    expect(transmitter.isKnownTool("tool-a")).toBe(true);
+    expect(transmitter.isKnownTool("tool-d")).toBe(false);
+  });
+
+  it("cap is enforced fresh after start() resets state", () => {
+    for (let i = 0; i < 5_000; i++) {
+      transmitter.recordToolSeen(`tool-${i}`);
+    }
+    expect(transmitter.knownToolCount).toBe(5_000);
+
+    // Restart clears the set
+    transmitter.stop();
+    transmitter.start({
+      apiKey: "test-key",
+      endpoint: "https://podwatch.app/api",
+      batchSize: 50,
+      flushIntervalMs: 999_999,
+    });
+
+    expect(transmitter.knownToolCount).toBe(0);
+  });
+});
+
 describe("transmitter — alert event mapping", () => {
   beforeEach(() => {
     vi.clearAllMocks();

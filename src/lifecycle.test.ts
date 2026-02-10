@@ -1,5 +1,5 @@
 /**
- * Tests for lifecycle handlers — scanner 30s delay, context pressure alerts.
+ * Tests for lifecycle handlers — scanner 30s delay, context pressure alerts, pulse backoff.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
@@ -153,5 +153,121 @@ describe("lifecycle — context pressure alerts", () => {
 
     const alerts = getEnqueued().filter((e: any) => e.type === "alert");
     expect(alerts).toHaveLength(0);
+  });
+});
+
+describe("lifecycle — pulse backoff on failure", () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    resetEnqueued();
+    fetchMock = vi.fn();
+    globalThis.fetch = fetchMock;
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("backs off after 3 consecutive pulse failures", async () => {
+    // Pulse fails every time
+    fetchMock.mockRejectedValue(new Error("network error"));
+
+    const api = makeApi();
+    registerLifecycleHandlers(api, { apiKey: "test", pulseIntervalMs: 300_000 });
+
+    // Initial pulse call (from register)
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // Advance 5min — 2nd pulse (failure #2)
+    await vi.advanceTimersByTimeAsync(300_000);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    // Advance 5min — 3rd pulse (failure #3 — triggers backoff)
+    await vi.advanceTimersByTimeAsync(300_000);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+
+    // After 3 failures, the interval should have increased.
+    // At normal 5min interval, the next pulse would fire at +5min.
+    // With backoff (10min), no pulse should fire at the normal +5min mark.
+    const callsBefore = fetchMock.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(300_000); // +5min — should NOT fire if backed off
+    // The backed-off interval is longer, so no new call at the original cadence
+    expect(fetchMock.mock.calls.length).toBe(callsBefore);
+  });
+
+  it("increases interval exponentially on repeated failures", async () => {
+    fetchMock.mockRejectedValue(new Error("network error"));
+
+    const api = makeApi();
+    registerLifecycleHandlers(api, { apiKey: "test", pulseIntervalMs: 300_000 });
+
+    // Drain initial pulse + 2 more at 5min intervals (3 consecutive failures)
+    await vi.advanceTimersByTimeAsync(600_000); // +10min total → 3 calls (initial + 2)
+    const callsAfter3 = fetchMock.mock.calls.length;
+    expect(callsAfter3).toBe(3);
+
+    // Now backed off to 10min. Advance 10min — should get 1 more call
+    await vi.advanceTimersByTimeAsync(600_000);
+    const callsAfterBackoff1 = fetchMock.mock.calls.length;
+    expect(callsAfterBackoff1).toBe(callsAfter3 + 1); // failure #4
+
+    // Now backed off to 20min. Advance 20min — should get 1 more call
+    await vi.advanceTimersByTimeAsync(1_200_000);
+    const callsAfterBackoff2 = fetchMock.mock.calls.length;
+    expect(callsAfterBackoff2).toBe(callsAfterBackoff1 + 1); // failure #5
+  });
+
+  it("resets interval to normal after successful pulse", async () => {
+    // First 3 calls fail, then succeed
+    fetchMock
+      .mockRejectedValueOnce(new Error("fail 1"))
+      .mockRejectedValueOnce(new Error("fail 2"))
+      .mockRejectedValueOnce(new Error("fail 3"))
+      .mockResolvedValueOnce({ ok: true, status: 200 }) // success!
+      .mockResolvedValue({ ok: true, status: 200 }); // future successes
+
+    const api = makeApi();
+    registerLifecycleHandlers(api, { apiKey: "test", pulseIntervalMs: 300_000 });
+
+    // Initial pulse (fail 1)
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // +5min → fail 2, +5min → fail 3 (triggers backoff)
+    await vi.advanceTimersByTimeAsync(600_000);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+
+    // Now interval is 10min. Advance 10min → success!
+    await vi.advanceTimersByTimeAsync(600_000);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+
+    // After success, interval should reset to 5min.
+    // Advance 5min — should get another call at the normal cadence
+    await vi.advanceTimersByTimeAsync(300_000);
+    expect(fetchMock).toHaveBeenCalledTimes(5);
+  });
+
+  it("caps backoff at 60min max", async () => {
+    fetchMock.mockRejectedValue(new Error("network error"));
+
+    const api = makeApi();
+    registerLifecycleHandlers(api, { apiKey: "test", pulseIntervalMs: 300_000 });
+
+    // Drain failures to push backoff past 60min:
+    // 3 failures at 5min → 10min backoff
+    await vi.advanceTimersByTimeAsync(600_000); // 3 calls
+    // failure 4 at 10min → 20min backoff
+    await vi.advanceTimersByTimeAsync(600_000); // 4 calls
+    // failure 5 at 20min → 40min backoff
+    await vi.advanceTimersByTimeAsync(1_200_000); // 5 calls
+    // failure 6 at 40min → 60min backoff (capped)
+    await vi.advanceTimersByTimeAsync(2_400_000); // 6 calls
+    const callsAtCap = fetchMock.mock.calls.length;
+    expect(callsAtCap).toBe(6);
+
+    // failure 7 should be at 60min (not 80min) — cap is 60min
+    await vi.advanceTimersByTimeAsync(3_600_000); // +60min
+    expect(fetchMock.mock.calls.length).toBe(callsAtCap + 1);
   });
 });

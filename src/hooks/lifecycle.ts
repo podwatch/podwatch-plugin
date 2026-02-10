@@ -18,8 +18,13 @@ import type {
 import { transmitter } from "../transmitter.js";
 import { scanSkillsAndPlugins } from "../scanner.js";
 
-let pulseTimer: ReturnType<typeof setInterval> | null = null;
+let pulseTimer: ReturnType<typeof setTimeout> | null = null;
 let scanTimer: ReturnType<typeof setInterval> | null = null;
+
+// Pulse backoff state
+let pulseFailureCount = 0;
+const PULSE_FAILURE_THRESHOLD = 3; // Start backoff after N consecutive failures
+const PULSE_MAX_INTERVAL_MS = 3_600_000; // 60 min cap
 
 /**
  * Register lifecycle hook handlers.
@@ -33,18 +38,13 @@ export function registerLifecycleHandlers(api: any, config: PodwatchConfig): voi
   // gateway_start is never emitted to plugins.
   // -----------------------------------------------------------------------
 
-  // Send initial pulse right now
-  void sendPulse(endpoint, apiKey);
+  const basePulseIntervalMs = config.pulseIntervalMs ?? 300_000;
 
-  // Start pulse interval (default 5 minutes)
-  if (pulseTimer) clearInterval(pulseTimer);
-  pulseTimer = setInterval(
-    () => void sendPulse(endpoint, apiKey),
-    config.pulseIntervalMs ?? 300_000
-  );
-  if (pulseTimer && typeof pulseTimer === "object" && "unref" in pulseTimer) {
-    pulseTimer.unref();
-  }
+  // Reset pulse backoff state
+  pulseFailureCount = 0;
+
+  // Send initial pulse right now
+  void sendPulseWithBackoff(endpoint, apiKey, basePulseIntervalMs);
 
   // Initial skill/plugin scan — delayed 30s to let gateway fully settle
   const workspaceDir = api.config?.agents?.defaults?.workspace;
@@ -83,7 +83,7 @@ export function registerLifecycleHandlers(api: any, config: PodwatchConfig): voi
     async (): Promise<void> => {
       // Stop intervals
       if (pulseTimer) {
-        clearInterval(pulseTimer);
+        clearTimeout(pulseTimer);
         pulseTimer = null;
       }
       if (scanTimer) {
@@ -149,11 +149,19 @@ export function registerLifecycleHandlers(api: any, config: PodwatchConfig): voi
 // ---------------------------------------------------------------------------
 
 /**
- * Send a lightweight pulse directly to the Podwatch API.
- * This bypasses the transmitter/events pipeline entirely —
- * pulses go to their own dedicated endpoint.
+ * Send a lightweight pulse directly to the Podwatch API, then schedule
+ * the next pulse. Uses exponential backoff after consecutive failures.
+ *
+ * Backoff kicks in after PULSE_FAILURE_THRESHOLD (3) consecutive failures:
+ *   base → 2x base → 4x base → ... capped at PULSE_MAX_INTERVAL_MS (60min)
+ * Resets to base interval on success.
  */
-async function sendPulse(endpoint: string, apiKey: string): Promise<void> {
+async function sendPulseWithBackoff(
+  endpoint: string,
+  apiKey: string,
+  baseIntervalMs: number,
+): Promise<void> {
+  let success = false;
   try {
     const response = await fetch(`${endpoint}/pulse`, {
       method: "POST",
@@ -169,11 +177,38 @@ async function sendPulse(endpoint: string, apiKey: string): Promise<void> {
       }),
       signal: AbortSignal.timeout(10_000),
     });
-    if (!response.ok) {
+    if (response.ok) {
+      success = true;
+    } else {
       console.error(`[podwatch/pulse] API ${response.status}`);
     }
   } catch (err) {
     console.error("[podwatch/pulse] Failed:", err);
+  }
+
+  // Update failure counter
+  if (success) {
+    pulseFailureCount = 0;
+  } else {
+    pulseFailureCount++;
+  }
+
+  // Calculate next interval
+  let nextIntervalMs = baseIntervalMs;
+  if (pulseFailureCount >= PULSE_FAILURE_THRESHOLD) {
+    // Exponential backoff: 2x base per failure beyond threshold
+    const backoffMultiplier = Math.pow(2, pulseFailureCount - PULSE_FAILURE_THRESHOLD);
+    nextIntervalMs = Math.min(baseIntervalMs * 2 * backoffMultiplier, PULSE_MAX_INTERVAL_MS);
+  }
+
+  // Schedule next pulse
+  if (pulseTimer) clearTimeout(pulseTimer);
+  pulseTimer = setTimeout(
+    () => void sendPulseWithBackoff(endpoint, apiKey, baseIntervalMs),
+    nextIntervalMs,
+  );
+  if (pulseTimer && typeof pulseTimer === "object" && "unref" in pulseTimer) {
+    pulseTimer.unref();
   }
 }
 
