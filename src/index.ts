@@ -17,6 +17,7 @@ import { registerSecurityHandlers } from "./hooks/security.js";
 import { registerSessionHandlers } from "./hooks/sessions.js";
 import { registerLifecycleHandlers } from "./hooks/lifecycle.js";
 import { transmitter } from "./transmitter.js";
+import { scheduleUpdateCheck } from "./updater.js";
 
 // ---------------------------------------------------------------------------
 // Plugin config interface
@@ -94,8 +95,13 @@ export default function register(api: any): void {
   registerLifecycleHandlers(api, config);
   console.log("[podwatch:debug] Lifecycle handlers registered");
 
+  // Schedule non-blocking auto-update check (30s after boot, 24h cooldown)
+  const currentVersion = api.version ?? "0.0.0";
+  const endpoint = config.endpoint ?? "https://podwatch.app/api";
+  scheduleUpdateCheck(currentVersion, endpoint, api.logger);
+
   api.logger.info(
-    `[podwatch] Plugin loaded. Budget enforcement: ${config.enableBudgetEnforcement ? "ON" : "OFF"}, ` +
+    `[podwatch] Plugin loaded (v${currentVersion}). Budget enforcement: ${config.enableBudgetEnforcement ? "ON" : "OFF"}, ` +
       `Security alerts: ${config.enableSecurityAlerts ? "ON" : "OFF"}, ` +
       `Diagnostics: ${diagnosticsEnabled ? "ON" : "OFF"}`
   );

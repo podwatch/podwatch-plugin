@@ -119,8 +119,4 @@ export interface PodwatchEvent {
   [key: string]: unknown;
 }
 
-// ---------------------------------------------------------------------------
-// Security types
-// ---------------------------------------------------------------------------
-
-export type RiskLevel = "SAFE" | "WARNING" | "DANGER";
+// (RiskLevel removed — classification moved to server side)

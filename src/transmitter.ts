@@ -97,7 +97,6 @@ function buildDescription(event: PodwatchEvent): string {
     case "tool_call": {
       const name = event.toolName ? String(event.toolName) : "unknown_tool";
       parts.push(`Called: ${name}`);
-      if (event.riskLevel && event.riskLevel !== "SAFE") parts.push(`risk=${event.riskLevel}`);
       break;
     }
     case "tool_result": {
@@ -140,7 +139,6 @@ function buildDescription(event: PodwatchEvent): string {
       if (event.message) parts.push(String(event.message));
       if (event.error) parts.push(`error: ${String(event.error).slice(0, 200)}`);
       if (event.loopDetected) parts.push(`loop_detected (${event.messagesPerMinute} msg/min)`);
-      if (event.riskLevel && event.riskLevel !== "SAFE") parts.push(`risk=${event.riskLevel}`);
       break;
     }
   }
@@ -375,7 +373,6 @@ export const transmitter = {
     if (buffer.length > MAX_BUFFER_SIZE) {
       const idx = buffer.findIndex(
         (e) =>
-          e.riskLevel !== "DANGER" &&
           e.type !== "setup_warning" &&
           e.type !== "security" &&
           e.type !== "budget_blocked"
