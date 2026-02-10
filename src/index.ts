@@ -39,19 +39,25 @@ export interface PodwatchConfig {
 // Plugin registration
 // ---------------------------------------------------------------------------
 
+const DEBUG = !!process.env.PODWATCH_DEBUG;
+
 /**
  * OpenClaw plugin entry point.
  * Called by the Gateway when the plugin is loaded.
  */
 export default function register(api: any): void {
-  console.log("[podwatch:debug] register() called");
-  console.log("[podwatch:debug] api object keys:", Object.keys(api));
-  console.log("[podwatch:debug] api.config:", JSON.stringify(api.config, null, 2)?.slice(0, 500));
-  console.log("[podwatch:debug] api.pluginConfig:", JSON.stringify(api.pluginConfig, null, 2));
-  console.log("[podwatch:debug] api.runtime keys:", api.runtime ? Object.keys(api.runtime) : "undefined");
+  if (DEBUG) {
+    console.log("[podwatch:debug] register() called");
+    console.log("[podwatch:debug] api object keys:", Object.keys(api));
+    console.log("[podwatch:debug] api.config:", JSON.stringify(api.config, null, 2)?.slice(0, 500));
+    console.log("[podwatch:debug] api.pluginConfig:", JSON.stringify(api.pluginConfig, null, 2));
+    console.log("[podwatch:debug] api.runtime keys:", api.runtime ? Object.keys(api.runtime) : "undefined");
+  }
 
   const config = resolveConfig(api);
-  console.log("[podwatch:debug] Resolved config:", JSON.stringify(config, null, 2));
+  if (DEBUG) {
+    console.log("[podwatch:debug] Resolved config:", JSON.stringify(config, null, 2));
+  }
 
   if (!config.apiKey) {
     api.logger.error(
@@ -65,12 +71,11 @@ export default function register(api: any): void {
     apiKey: config.apiKey,
     endpoint: config.endpoint ?? "https://podwatch.app/api",
     batchSize: 50,
-    flushIntervalMs: 5_000,
+    flushIntervalMs: 30_000,
   });
 
   // Check if diagnostics are enabled
   const diagnosticsEnabled = api.config?.diagnostics?.enabled === true;
-  console.log("[podwatch:debug] diagnosticsEnabled:", diagnosticsEnabled);
   if (!diagnosticsEnabled) {
     api.logger.warn(
       "[podwatch] diagnostics.enabled is not set to true in gateway config. " +
@@ -85,15 +90,10 @@ export default function register(api: any): void {
   }
 
   // Register all hook handlers
-  console.log("[podwatch:debug] Registering hook handlers...");
   registerCostHandler(api, config, diagnosticsEnabled);
-  console.log("[podwatch:debug] Cost handler registered");
   registerSecurityHandlers(api, config);
-  console.log("[podwatch:debug] Security handlers registered");
   registerSessionHandlers(api);
-  console.log("[podwatch:debug] Session handlers registered");
   registerLifecycleHandlers(api, config);
-  console.log("[podwatch:debug] Lifecycle handlers registered");
 
   // Schedule non-blocking auto-update check (30s after boot, 24h cooldown)
   const currentVersion = api.version ?? "0.0.0";
@@ -113,9 +113,11 @@ export default function register(api: any): void {
 
 function resolveConfig(api: any): PodwatchConfig {
   const pluginConfig = api.pluginConfig ?? {};
-  console.log("[podwatch:debug] resolveConfig() — raw pluginConfig:", JSON.stringify(pluginConfig, null, 2));
-  console.log("[podwatch:debug] resolveConfig() — env PODWATCH_API_KEY set:", !!process.env.PODWATCH_API_KEY);
-  console.log("[podwatch:debug] resolveConfig() — env PODWATCH_ENDPOINT:", process.env.PODWATCH_ENDPOINT ?? "(unset)");
+  if (DEBUG) {
+    console.log("[podwatch:debug] resolveConfig() — raw pluginConfig:", JSON.stringify(pluginConfig, null, 2));
+    console.log("[podwatch:debug] resolveConfig() — env PODWATCH_API_KEY set:", !!process.env.PODWATCH_API_KEY);
+    console.log("[podwatch:debug] resolveConfig() — env PODWATCH_ENDPOINT:", process.env.PODWATCH_ENDPOINT ?? "(unset)");
+  }
 
   return {
     apiKey: pluginConfig.apiKey ?? process.env.PODWATCH_API_KEY ?? "",

@@ -5,13 +5,24 @@
  * Instead, we use before_agent_start which provides the full session history
  * with usage data on every assistant message:
  *   { provider, model, usage: { input, output, cacheRead, cacheWrite, totalTokens, cost: { total } } }
+ *
+ * Dedup strategy: lastSeenIndex tracks how far we've read into event.messages.
+ * Each invocation only processes messages from lastSeenIndex onwards, then
+ * advances the pointer. Zero memory growth, O(1) bookkeeping.
  */
 
 import type { PodwatchConfig } from "../index.js";
 import { transmitter } from "../transmitter.js";
 
-// Track processed messages to avoid double-counting
-const processedTimestamps = new Set<number>();
+// Track how far into event.messages we've already processed
+let lastSeenIndex = 0;
+
+/**
+ * Reset dedup state (exported for testing).
+ */
+export function _resetCostState(): void {
+  lastSeenIndex = 0;
+}
 
 /**
  * Register the cost handler via before_agent_start hook.
@@ -24,6 +35,12 @@ export function registerCostHandler(
   // before_agent_start carries the full message history with usage on each assistant turn
   api.on("before_agent_start", async (event: any, ctx: any) => {
     if (!event?.messages || !Array.isArray(event.messages)) return;
+
+    // Only process new messages since last invocation
+    const newMessages = event.messages.slice(lastSeenIndex);
+    lastSeenIndex = event.messages.length;
+
+    if (newMessages.length === 0) return;
 
     // Detect heartbeat-triggered turns by scanning the last user message
     // OpenClaw heartbeat prompts always contain "HEARTBEAT" (e.g. "Read HEARTBEAT.md")
@@ -39,15 +56,10 @@ export function registerCostHandler(
       }
     }
 
-    for (const msg of event.messages) {
+    for (const msg of newMessages) {
       // Only assistant messages have usage data
       if (msg.role !== "assistant") continue;
       if (!msg.usage) continue;
-      if (!msg.timestamp) continue;
-
-      // Skip already-processed messages
-      if (processedTimestamps.has(msg.timestamp)) continue;
-      processedTimestamps.add(msg.timestamp);
 
       // Skip zero-cost internal messages (delivery-mirror, etc.)
       if (msg.provider === "openclaw" || msg.model === "delivery-mirror") continue;
@@ -57,7 +69,7 @@ export function registerCostHandler(
 
       transmitter.enqueue({
         type: "cost",
-        ts: msg.timestamp,
+        ts: msg.timestamp ?? Date.now(),
         sessionKey: ctx?.sessionKey,
         agentId: ctx?.agentId,
         provider: msg.provider,
@@ -68,18 +80,11 @@ export function registerCostHandler(
         cacheWriteTokens: msg.usage.cacheWrite ?? 0,
         totalTokens: msg.usage.totalTokens ?? ((msg.usage.input ?? 0) + (msg.usage.output ?? 0)),
         costUsd: costTotal,
+        costBreakdown: msg.usage.cost, // full {input, output, cacheRead, cacheWrite, total} object
         durationMs: undefined,
         // Tag heartbeat-triggered cost events so the dashboard can distinguish them
         ...(isHeartbeat ? { sessionType: "heartbeat" } : {}),
       });
-    }
-
-    // Prune old timestamps to prevent unbounded memory growth
-    // Keep last 1000 entries
-    if (processedTimestamps.size > 1000) {
-      const arr = [...processedTimestamps].sort((a, b) => a - b);
-      const toRemove = arr.slice(0, arr.length - 500);
-      for (const ts of toRemove) processedTimestamps.delete(ts);
     }
   });
 

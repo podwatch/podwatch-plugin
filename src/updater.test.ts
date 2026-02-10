@@ -6,28 +6,35 @@
  * - 24-hour cooldown caching
  * - NPM registry version check
  * - Dashboard API fallback version check
- * - Update execution via openclaw plugins update
+ * - Update execution via npm pack + extract
+ * - Restart sentinel writing
+ * - Service name resolution (systemd unit, launchd label)
+ * - Gateway restart via systemctl (Linux)
+ * - Gateway restart via launchctl (macOS)
+ * - Fallback logging for unsupported platforms
  * - Error handling (network failures, bad JSON, timeouts)
- * - Safety guards (no restart during active turn)
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 // ---------------------------------------------------------------------------
-// Mock child_process.exec BEFORE importing the module under test
+// Mock child_process BEFORE importing the module under test
 // ---------------------------------------------------------------------------
 
-const mockExec = vi.fn();
+const mockSpawnSync = vi.fn();
 
 vi.mock("node:child_process", () => ({
-  exec: (...args: unknown[]) => mockExec(...args),
+  execSync: vi.fn(),
+  spawnSync: (...args: unknown[]) => mockSpawnSync(...args),
 }));
 
-// Mock fs for cache file operations
+// Mock fs for cache file and sentinel operations
 const mockReadFileSync = vi.fn();
 const mockWriteFileSync = vi.fn();
 const mockMkdirSync = vi.fn();
 const mockExistsSync = vi.fn();
+const mockMkdtempSync = vi.fn();
+const mockRmSync = vi.fn();
 
 vi.mock("node:fs", () => ({
   default: {
@@ -35,11 +42,25 @@ vi.mock("node:fs", () => ({
     writeFileSync: (...args: unknown[]) => mockWriteFileSync(...args),
     mkdirSync: (...args: unknown[]) => mockMkdirSync(...args),
     existsSync: (...args: unknown[]) => mockExistsSync(...args),
+    mkdtempSync: (...args: unknown[]) => mockMkdtempSync(...args),
+    rmSync: (...args: unknown[]) => mockRmSync(...args),
   },
   readFileSync: (...args: unknown[]) => mockReadFileSync(...args),
   writeFileSync: (...args: unknown[]) => mockWriteFileSync(...args),
   mkdirSync: (...args: unknown[]) => mockMkdirSync(...args),
   existsSync: (...args: unknown[]) => mockExistsSync(...args),
+  mkdtempSync: (...args: unknown[]) => mockMkdtempSync(...args),
+  rmSync: (...args: unknown[]) => mockRmSync(...args),
+}));
+
+// Mock os
+vi.mock("node:os", () => ({
+  default: {
+    tmpdir: () => "/tmp",
+    homedir: () => "/home/testuser",
+  },
+  tmpdir: () => "/tmp",
+  homedir: () => "/home/testuser",
 }));
 
 // Mock global fetch
@@ -53,6 +74,12 @@ import {
   executeUpdate,
   shouldCheckForUpdate,
   writeCacheTimestamp,
+  writeRestartSentinel,
+  triggerGatewayRestart,
+  resolveStateDir,
+  resolveGatewaySystemdServiceName,
+  resolveGatewayLaunchAgentLabel,
+  normalizeSystemdUnit,
   AUTO_UPDATE_CACHE_FILE,
 } from "./updater.js";
 
@@ -66,6 +93,14 @@ function jsonResponse(data: unknown, status = 200): Response {
     status,
     json: () => Promise.resolve(data),
   } as Response;
+}
+
+function mockLogger() {
+  return {
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -254,41 +289,537 @@ describe("checkForUpdate", () => {
 
 describe("executeUpdate", () => {
   beforeEach(() => {
-    vi.clearAllMocks();
+    vi.resetAllMocks();
+    mockMkdtempSync.mockReturnValue("/tmp/podwatch-update-abc123");
+    // Default: dist dir does not exist
+    mockExistsSync.mockReturnValue(false);
   });
 
-  it("runs openclaw plugins update podwatch", async () => {
-    mockExec.mockImplementation((_cmd: string, _opts: unknown, cb: Function) => {
-      cb(null, "Updated podwatch to 1.1.0", "");
-    });
+  it("runs npm pack and extracts the tarball", () => {
+    // npm pack succeeds
+    mockSpawnSync
+      .mockReturnValueOnce({
+        error: null,
+        status: 0,
+        stdout: "podwatch-1.1.0.tgz\n",
+        stderr: "",
+      })
+      // tar extract succeeds
+      .mockReturnValueOnce({
+        error: null,
+        status: 0,
+        stdout: "",
+        stderr: "",
+      });
 
-    const result = await executeUpdate();
+    const result = executeUpdate();
     expect(result.success).toBe(true);
-    expect(mockExec).toHaveBeenCalledWith(
-      "openclaw plugins update podwatch",
-      expect.objectContaining({ timeout: 60_000 }),
-      expect.any(Function)
+    expect(mockSpawnSync).toHaveBeenCalledWith(
+      "npm",
+      ["pack", "podwatch", "--pack-destination", "/tmp/podwatch-update-abc123"],
+      expect.objectContaining({ timeout: 120_000 })
+    );
+    expect(mockSpawnSync).toHaveBeenCalledWith(
+      "tar",
+      expect.arrayContaining(["xzf", "/tmp/podwatch-update-abc123/podwatch-1.1.0.tgz"]),
+      expect.any(Object)
     );
   });
 
-  it("returns failure on exec error", async () => {
-    mockExec.mockImplementation((_cmd: string, _opts: unknown, cb: Function) => {
-      cb(new Error("command failed"), "", "npm ERR!");
+  it("returns failure when npm pack fails with error", () => {
+    mockSpawnSync.mockReturnValueOnce({
+      error: new Error("npm not found"),
+      status: 1,
+      stdout: "",
+      stderr: "command not found",
     });
 
-    const result = await executeUpdate();
+    const result = executeUpdate();
     expect(result.success).toBe(false);
-    expect(result.error).toContain("command failed");
+    expect(result.error).toContain("npm not found");
   });
 
-  it("returns failure on non-zero exit", async () => {
-    mockExec.mockImplementation((_cmd: string, _opts: unknown, cb: Function) => {
-      cb(null, "", "some warning but nonzero");
-      // Simulate exec returning an error-like status
+  it("returns failure when npm pack exits non-zero", () => {
+    mockSpawnSync.mockReturnValueOnce({
+      error: null,
+      status: 1,
+      stdout: "",
+      stderr: "npm ERR! 404",
     });
 
-    // Even with no error, the function should succeed — only Error param = failure
-    const result = await executeUpdate();
-    expect(result.success).toBe(true);
+    const result = executeUpdate();
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("status 1");
+  });
+
+  it("returns failure when npm pack outputs empty stdout", () => {
+    mockSpawnSync.mockReturnValueOnce({
+      error: null,
+      status: 0,
+      stdout: "   \n",
+      stderr: "",
+    });
+
+    const result = executeUpdate();
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("tarball filename");
+  });
+
+  it("returns failure when tar extract fails", () => {
+    // npm pack succeeds
+    mockSpawnSync
+      .mockReturnValueOnce({
+        error: null,
+        status: 0,
+        stdout: "podwatch-1.1.0.tgz\n",
+        stderr: "",
+      })
+      // tar extract fails
+      .mockReturnValueOnce({
+        error: new Error("tar failed"),
+        status: 1,
+        stdout: "",
+        stderr: "error extracting",
+      });
+
+    const result = executeUpdate();
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("tar failed");
+  });
+
+  it("cleans old dist directory before extracting", () => {
+    // dist exists
+    mockExistsSync.mockReturnValue(true);
+    // npm pack succeeds
+    mockSpawnSync
+      .mockReturnValueOnce({
+        error: null,
+        status: 0,
+        stdout: "podwatch-1.1.0.tgz\n",
+        stderr: "",
+      })
+      // tar extract succeeds
+      .mockReturnValueOnce({
+        error: null,
+        status: 0,
+        stdout: "",
+        stderr: "",
+      });
+
+    executeUpdate();
+    expect(mockRmSync).toHaveBeenCalledWith(
+      expect.stringContaining("dist"),
+      { recursive: true, force: true }
+    );
+  });
+
+  it("cleans up temp dir after success", () => {
+    // npm pack succeeds
+    mockSpawnSync
+      .mockReturnValueOnce({
+        error: null,
+        status: 0,
+        stdout: "podwatch-1.1.0.tgz\n",
+        stderr: "",
+      })
+      // tar extract succeeds
+      .mockReturnValueOnce({
+        error: null,
+        status: 0,
+        stdout: "",
+        stderr: "",
+      });
+
+    executeUpdate();
+    // rmSync called for cleanup (temp dir) — may also be called for dist
+    expect(mockRmSync).toHaveBeenCalledWith(
+      "/tmp/podwatch-update-abc123",
+      { recursive: true, force: true }
+    );
+  });
+});
+
+describe("writeRestartSentinel", () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    vi.stubEnv("HOME", "/home/testuser");
+    delete process.env.OPENCLAW_STATE_DIR;
+    delete process.env.CLAWDBOT_STATE_DIR;
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it("writes sentinel JSON with correct structure", () => {
+    writeRestartSentinel("1.2.0");
+
+    expect(mockMkdirSync).toHaveBeenCalledWith(
+      expect.stringContaining("state"),
+      { recursive: true }
+    );
+    expect(mockWriteFileSync).toHaveBeenCalledWith(
+      expect.stringContaining("restart-sentinel.json"),
+      expect.any(String),
+      "utf-8"
+    );
+
+    // Parse the written JSON
+    const writtenContent = mockWriteFileSync.mock.calls[0][1] as string;
+    const parsed = JSON.parse(writtenContent);
+    expect(parsed.version).toBe(1);
+    expect(parsed.payload.kind).toBe("update");
+    expect(parsed.payload.status).toBe("ok");
+    expect(parsed.payload.message).toBe("Podwatch plugin updated to v1.2.0");
+    expect(parsed.payload.doctorHint).toBe("Run: openclaw doctor --non-interactive");
+    expect(typeof parsed.payload.ts).toBe("number");
+  });
+
+  it("returns the sentinel path", () => {
+    const result = writeRestartSentinel("1.2.0");
+    expect(result).toContain("restart-sentinel.json");
+  });
+
+  it("does not throw on write error", () => {
+    mockMkdirSync.mockImplementation(() => {
+      throw new Error("EPERM");
+    });
+    expect(() => writeRestartSentinel("1.2.0")).not.toThrow();
+  });
+
+  it("respects OPENCLAW_STATE_DIR env var", () => {
+    vi.stubEnv("OPENCLAW_STATE_DIR", "/custom/state");
+    writeRestartSentinel("1.2.0");
+
+    expect(mockWriteFileSync).toHaveBeenCalled();
+    const writtenPath = mockWriteFileSync.mock.calls[0][0] as string;
+    expect(writtenPath).toContain("/custom/state");
+  });
+});
+
+describe("resolveStateDir", () => {
+  beforeEach(() => {
+    delete process.env.OPENCLAW_STATE_DIR;
+    delete process.env.CLAWDBOT_STATE_DIR;
+  });
+
+  it("returns OPENCLAW_STATE_DIR when set", () => {
+    vi.stubEnv("OPENCLAW_STATE_DIR", "/custom/state");
+    expect(resolveStateDir()).toBe("/custom/state");
+    vi.unstubAllEnvs();
+  });
+
+  it("returns CLAWDBOT_STATE_DIR when set", () => {
+    vi.stubEnv("CLAWDBOT_STATE_DIR", "/legacy/state");
+    expect(resolveStateDir()).toBe("/legacy/state");
+    vi.unstubAllEnvs();
+  });
+
+  it("defaults to ~/.openclaw", () => {
+    const result = resolveStateDir();
+    expect(result).toContain(".openclaw");
+  });
+});
+
+describe("service name resolution", () => {
+  describe("resolveGatewaySystemdServiceName", () => {
+    it("returns default name for undefined profile", () => {
+      expect(resolveGatewaySystemdServiceName(undefined)).toBe("openclaw-gateway");
+    });
+
+    it("returns default name for 'default' profile", () => {
+      expect(resolveGatewaySystemdServiceName("default")).toBe("openclaw-gateway");
+    });
+
+    it("returns profiled name for custom profile", () => {
+      expect(resolveGatewaySystemdServiceName("myprofile")).toBe("openclaw-gateway-myprofile");
+    });
+
+    it("trims whitespace", () => {
+      expect(resolveGatewaySystemdServiceName("  myprofile  ")).toBe("openclaw-gateway-myprofile");
+    });
+  });
+
+  describe("resolveGatewayLaunchAgentLabel", () => {
+    it("returns default label for undefined profile", () => {
+      expect(resolveGatewayLaunchAgentLabel(undefined)).toBe("ai.openclaw.gateway");
+    });
+
+    it("returns default label for 'default' profile", () => {
+      expect(resolveGatewayLaunchAgentLabel("default")).toBe("ai.openclaw.gateway");
+    });
+
+    it("returns profiled label for custom profile", () => {
+      expect(resolveGatewayLaunchAgentLabel("myprofile")).toBe("ai.openclaw.myprofile");
+    });
+  });
+
+  describe("normalizeSystemdUnit", () => {
+    it("appends .service when missing", () => {
+      expect(normalizeSystemdUnit("my-unit", undefined)).toBe("my-unit.service");
+    });
+
+    it("does not double-append .service", () => {
+      expect(normalizeSystemdUnit("my-unit.service", undefined)).toBe("my-unit.service");
+    });
+
+    it("uses raw unit name when provided", () => {
+      expect(normalizeSystemdUnit("custom-unit", undefined)).toBe("custom-unit.service");
+    });
+
+    it("falls back to default when raw is undefined", () => {
+      expect(normalizeSystemdUnit(undefined, undefined)).toBe("openclaw-gateway.service");
+    });
+
+    it("falls back to profiled name when raw is empty", () => {
+      expect(normalizeSystemdUnit("", "staging")).toBe("openclaw-gateway-staging.service");
+    });
+  });
+});
+
+describe("triggerGatewayRestart", () => {
+  const originalPlatform = process.platform;
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    delete process.env.OPENCLAW_SYSTEMD_UNIT;
+    delete process.env.OPENCLAW_PROFILE;
+    delete process.env.OPENCLAW_LAUNCHD_LABEL;
+  });
+
+  afterEach(() => {
+    Object.defineProperty(process, "platform", { value: originalPlatform });
+  });
+
+  describe("Linux (systemd)", () => {
+    beforeEach(() => {
+      Object.defineProperty(process, "platform", { value: "linux" });
+    });
+
+    it("tries systemctl --user restart first", () => {
+      mockSpawnSync.mockReturnValueOnce({ error: null, status: 0, stdout: "", stderr: "" });
+
+      const logger = mockLogger();
+      const result = triggerGatewayRestart(logger);
+
+      expect(result.ok).toBe(true);
+      expect(result.method).toBe("systemd");
+      expect(mockSpawnSync).toHaveBeenCalledWith(
+        "systemctl",
+        ["--user", "restart", "openclaw-gateway.service"],
+        expect.any(Object)
+      );
+      expect(logger.info).toHaveBeenCalledWith(
+        expect.stringContaining("systemctl --user")
+      );
+    });
+
+    it("falls back to system systemctl when user fails", () => {
+      // User-level fails
+      mockSpawnSync
+        .mockReturnValueOnce({ error: null, status: 1, stdout: "", stderr: "failed" })
+        // System-level succeeds
+        .mockReturnValueOnce({ error: null, status: 0, stdout: "", stderr: "" });
+
+      const logger = mockLogger();
+      const result = triggerGatewayRestart(logger);
+
+      expect(result.ok).toBe(true);
+      expect(result.method).toBe("systemd");
+      expect(mockSpawnSync).toHaveBeenCalledTimes(2);
+      expect(mockSpawnSync).toHaveBeenNthCalledWith(
+        2,
+        "systemctl",
+        ["restart", "openclaw-gateway.service"],
+        expect.any(Object)
+      );
+    });
+
+    it("reports failure when both systemctl calls fail", () => {
+      mockSpawnSync
+        .mockReturnValueOnce({ error: null, status: 1, stdout: "", stderr: "" })
+        .mockReturnValueOnce({ error: null, status: 1, stdout: "", stderr: "" });
+
+      const logger = mockLogger();
+      const result = triggerGatewayRestart(logger);
+
+      expect(result.ok).toBe(false);
+      expect(result.method).toBe("systemd");
+      expect(result.tried).toHaveLength(2);
+      expect(logger.error).toHaveBeenCalledOnce();
+      expect(logger.error.mock.calls[0][0]).toContain("restart the gateway manually");
+    });
+
+    it("uses OPENCLAW_SYSTEMD_UNIT env var", () => {
+      process.env.OPENCLAW_SYSTEMD_UNIT = "my-custom-unit";
+      mockSpawnSync.mockReturnValueOnce({ error: null, status: 0, stdout: "", stderr: "" });
+
+      const logger = mockLogger();
+      triggerGatewayRestart(logger);
+
+      expect(mockSpawnSync).toHaveBeenCalledWith(
+        "systemctl",
+        ["--user", "restart", "my-custom-unit.service"],
+        expect.any(Object)
+      );
+    });
+
+    it("uses OPENCLAW_PROFILE env var for service name", () => {
+      process.env.OPENCLAW_PROFILE = "staging";
+      mockSpawnSync.mockReturnValueOnce({ error: null, status: 0, stdout: "", stderr: "" });
+
+      const logger = mockLogger();
+      triggerGatewayRestart(logger);
+
+      expect(mockSpawnSync).toHaveBeenCalledWith(
+        "systemctl",
+        ["--user", "restart", "openclaw-gateway-staging.service"],
+        expect.any(Object)
+      );
+    });
+
+    it("handles spawnSync errors", () => {
+      mockSpawnSync
+        .mockReturnValueOnce({
+          error: new Error("ENOENT"),
+          status: null,
+          stdout: "",
+          stderr: "",
+        })
+        .mockReturnValueOnce({
+          error: new Error("ENOENT"),
+          status: null,
+          stdout: "",
+          stderr: "",
+        });
+
+      const logger = mockLogger();
+      const result = triggerGatewayRestart(logger);
+
+      expect(result.ok).toBe(false);
+      expect(result.detail).toContain("ENOENT");
+    });
+  });
+
+  describe("macOS (launchctl)", () => {
+    beforeEach(() => {
+      Object.defineProperty(process, "platform", { value: "darwin" });
+    });
+
+    it("uses launchctl kickstart -k", () => {
+      mockSpawnSync.mockReturnValueOnce({ error: null, status: 0, stdout: "", stderr: "" });
+
+      const logger = mockLogger();
+      const result = triggerGatewayRestart(logger);
+
+      expect(result.ok).toBe(true);
+      expect(result.method).toBe("launchctl");
+      expect(mockSpawnSync).toHaveBeenCalledWith(
+        "launchctl",
+        expect.arrayContaining(["kickstart", "-k"]),
+        expect.any(Object)
+      );
+      expect(logger.info).toHaveBeenCalledWith(
+        expect.stringContaining("launchctl")
+      );
+    });
+
+    it("includes gui/<uid> in target when getuid available", () => {
+      const originalGetuid = process.getuid;
+      process.getuid = () => 501;
+
+      mockSpawnSync.mockReturnValueOnce({ error: null, status: 0, stdout: "", stderr: "" });
+
+      const logger = mockLogger();
+      triggerGatewayRestart(logger);
+
+      expect(mockSpawnSync).toHaveBeenCalledWith(
+        "launchctl",
+        ["kickstart", "-k", "gui/501/ai.openclaw.gateway"],
+        expect.any(Object)
+      );
+
+      process.getuid = originalGetuid;
+    });
+
+    it("uses OPENCLAW_LAUNCHD_LABEL env var", () => {
+      process.env.OPENCLAW_LAUNCHD_LABEL = "com.custom.gateway";
+      const originalGetuid = process.getuid;
+      process.getuid = () => 501;
+
+      mockSpawnSync.mockReturnValueOnce({ error: null, status: 0, stdout: "", stderr: "" });
+
+      const logger = mockLogger();
+      triggerGatewayRestart(logger);
+
+      expect(mockSpawnSync).toHaveBeenCalledWith(
+        "launchctl",
+        ["kickstart", "-k", "gui/501/com.custom.gateway"],
+        expect.any(Object)
+      );
+
+      process.getuid = originalGetuid;
+    });
+
+    it("uses OPENCLAW_PROFILE for label resolution", () => {
+      process.env.OPENCLAW_PROFILE = "staging";
+      const originalGetuid = process.getuid;
+      process.getuid = () => 501;
+
+      mockSpawnSync.mockReturnValueOnce({ error: null, status: 0, stdout: "", stderr: "" });
+
+      const logger = mockLogger();
+      triggerGatewayRestart(logger);
+
+      expect(mockSpawnSync).toHaveBeenCalledWith(
+        "launchctl",
+        ["kickstart", "-k", "gui/501/ai.openclaw.staging"],
+        expect.any(Object)
+      );
+
+      process.getuid = originalGetuid;
+    });
+
+    it("reports failure when launchctl fails", () => {
+      mockSpawnSync.mockReturnValueOnce({
+        error: new Error("launchctl not found"),
+        status: null,
+        stdout: "",
+        stderr: "",
+      });
+
+      const logger = mockLogger();
+      const result = triggerGatewayRestart(logger);
+
+      expect(result.ok).toBe(false);
+      expect(result.method).toBe("launchctl");
+      expect(logger.error).toHaveBeenCalledOnce();
+      expect(logger.error.mock.calls[0][0]).toContain("restart the gateway manually");
+    });
+  });
+
+  describe("unsupported platform", () => {
+    it("returns failure for Windows", () => {
+      Object.defineProperty(process, "platform", { value: "win32" });
+
+      const logger = mockLogger();
+      const result = triggerGatewayRestart(logger);
+
+      expect(result.ok).toBe(false);
+      expect(result.method).toBe("unsupported");
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining("Unsupported platform")
+      );
+    });
+
+    it("returns failure for FreeBSD", () => {
+      Object.defineProperty(process, "platform", { value: "freebsd" });
+
+      const logger = mockLogger();
+      const result = triggerGatewayRestart(logger);
+
+      expect(result.ok).toBe(false);
+      expect(result.method).toBe("unsupported");
+    });
   });
 });

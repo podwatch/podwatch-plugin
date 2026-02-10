@@ -25,8 +25,6 @@ let scanTimer: ReturnType<typeof setInterval> | null = null;
  * Register lifecycle hook handlers.
  */
 export function registerLifecycleHandlers(api: any, config: PodwatchConfig): void {
-  console.log("[podwatch:debug] registerLifecycleHandlers() called");
-
   const endpoint = config.endpoint ?? "https://podwatch.app/api";
   const apiKey = config.apiKey;
 
@@ -36,7 +34,6 @@ export function registerLifecycleHandlers(api: any, config: PodwatchConfig): voi
   // -----------------------------------------------------------------------
 
   // Send initial pulse right now
-  console.log("[podwatch:debug] Starting pulse timer from register()");
   void sendPulse(endpoint, apiKey);
 
   // Start pulse interval (default 5 minutes)
@@ -49,12 +46,11 @@ export function registerLifecycleHandlers(api: any, config: PodwatchConfig): voi
     pulseTimer.unref();
   }
 
-  // Initial skill/plugin scan (fallback — also attempted in gateway_start)
+  // Initial skill/plugin scan — delayed 30s to let gateway fully settle
   const workspaceDir = api.config?.agents?.defaults?.workspace;
-  console.log("[podwatch:debug] Running initial scan from register()");
-  void runScan(workspaceDir);
+  setTimeout(() => void runScan(workspaceDir), 30_000);
 
-  // Start periodic scan interval
+  // Start periodic scan interval (default 6h)
   if (scanTimer) clearInterval(scanTimer);
   scanTimer = setInterval(
     () => void runScan(workspaceDir),
@@ -74,9 +70,6 @@ export function registerLifecycleHandlers(api: any, config: PodwatchConfig): voi
   api.on(
     "gateway_start",
     async (event: GatewayStartEvent): Promise<void> => {
-      console.log("[podwatch:debug] === gateway_start (best-effort) ===");
-      console.log("[podwatch:debug] gateway_start event:", JSON.stringify(event, null, 2));
-
       // Re-run scan as best-effort; pulse is already running
       void runScan(api.config?.agents?.defaults?.workspace);
     }
@@ -88,7 +81,6 @@ export function registerLifecycleHandlers(api: any, config: PodwatchConfig): voi
   api.on(
     "gateway_stop",
     async (): Promise<void> => {
-      console.log("[podwatch:debug] === gateway_stop ===");
       // Stop intervals
       if (pulseTimer) {
         clearInterval(pulseTimer);
@@ -118,9 +110,6 @@ export function registerLifecycleHandlers(api: any, config: PodwatchConfig): voi
   api.on(
     "before_compaction",
     async (event: BeforeCompactionEvent, ctx: PluginHookAgentContext): Promise<void> => {
-      console.log("[podwatch:debug] === before_compaction ===");
-      console.log("[podwatch:debug] before_compaction event:", JSON.stringify(event, null, 2));
-      console.log("[podwatch:debug] before_compaction ctx:", JSON.stringify(ctx, null, 2));
       transmitter.enqueue({
         type: "compaction",
         ts: Date.now(),
@@ -129,6 +118,28 @@ export function registerLifecycleHandlers(api: any, config: PodwatchConfig): voi
         sessionKey: ctx.sessionKey,
         agentId: ctx.agentId,
       });
+
+      // Context pressure alert — only if both fields are available
+      if (
+        typeof event.tokenCount === "number" &&
+        typeof (event as any).contextLimit === "number"
+      ) {
+        const contextLimit = (event as any).contextLimit as number;
+        const ratio = event.tokenCount / contextLimit;
+        if (ratio > 0.8) {
+          transmitter.enqueue({
+            type: "alert",
+            ts: Date.now(),
+            severity: "warning",
+            pattern: "context_pressure",
+            tokenCount: event.tokenCount,
+            contextLimit,
+            ratio,
+            sessionKey: ctx.sessionKey,
+            agentId: ctx.agentId,
+          });
+        }
+      }
     }
   );
 }

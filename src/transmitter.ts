@@ -9,9 +9,14 @@
  * - Credential access tracking (for exfiltration detection)
  * - Known tool tracking (for first-time tool alerts)
  * - Cached budget state (synced every 60s from dashboard)
+ * - Local audit log for dropped events
+ * - 402 trial-expired handling
  */
 
 import type { TransmitterConfig, PodwatchEvent } from "./types.js";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import * as os from "node:os";
 
 // ---------------------------------------------------------------------------
 // State
@@ -22,9 +27,12 @@ let buffer: PodwatchEvent[] = [];
 let flushTimer: ReturnType<typeof setInterval> | null = null;
 let flushInProgress = false;
 let retryBackoffMs = 1_000;
-const MAX_BACKOFF_MS = 60_000;
+const MAX_BACKOFF_MS = 30_000;
 const MAX_BUFFER_SIZE = 1_000;
 const PLUGIN_VERSION = "0.1.0";
+
+// --- Trial expired flag ---
+let trialExpired = false;
 
 // --- Credential access tracking ---
 interface CredentialAccess {
@@ -50,6 +58,30 @@ interface CachedBudget {
 let cachedBudget: CachedBudget | null = null;
 let budgetSyncTimer: ReturnType<typeof setInterval> | null = null;
 const BUDGET_SYNC_INTERVAL_MS = 60_000;
+
+// ---------------------------------------------------------------------------
+// Audit log for dropped events
+// ---------------------------------------------------------------------------
+
+function getAuditLogPath(): string {
+  return path.join(os.homedir(), ".openclaw", "extensions", "podwatch", "audit.log");
+}
+
+function writeAuditLog(reason: string, eventCount: number, events: PodwatchEvent[]): void {
+  try {
+    const logDir = path.dirname(getAuditLogPath());
+    fs.mkdirSync(logDir, { recursive: true });
+    const entry = JSON.stringify({
+      ts: new Date().toISOString(),
+      reason,
+      eventCount,
+      eventTypes: events.map((e) => e.type),
+    });
+    fs.appendFileSync(getAuditLogPath(), entry + "\n");
+  } catch {
+    // Best-effort — don't crash the plugin over audit logging
+  }
+}
 
 // ---------------------------------------------------------------------------
 // HTTP flush
@@ -82,6 +114,8 @@ function mapResultStatus(event: PodwatchEvent): string {
       return "scan";
     case "setup_warning":
       return "warning";
+    case "alert":
+      return "alert";
     default:
       return event.type || "unknown";
   }
@@ -163,7 +197,7 @@ function mapSessionType(event: PodwatchEvent): "interactive" | "heartbeat" | "cr
   if (event.type === "tool_call" || event.type === "tool_result" || event.type === "cost" ||
       event.type === "security" || event.type === "budget_blocked" ||
       event.type === "session_start" || event.type === "session_end" ||
-      event.type === "compaction") return "interactive";
+      event.type === "compaction" || event.type === "alert") return "interactive";
   return "unknown";
 }
 
@@ -279,8 +313,19 @@ async function sendBatch(events: PodwatchEvent[]): Promise<boolean> {
       return true;
     }
 
+    // 402 — trial expired, disable all future transmissions
+    if (response.status === 402) {
+      trialExpired = true;
+      console.warn(
+        "[podwatch] Trial expired (402) — event transmission disabled. Visit podwatch.app to upgrade."
+      );
+      return true; // consume the batch (don't retry)
+    }
+
+    // Other 4xx — client error, drop events + audit log
     if (response.status >= 400 && response.status < 500) {
       console.error(`[podwatch] API ${response.status}: dropping ${events.length} events`);
+      writeAuditLog(`http_${response.status}`, events.length, events);
       retryBackoffMs = 1_000;
       return true; // Don't retry client errors
     }
@@ -300,6 +345,12 @@ async function sendBatch(events: PodwatchEvent[]): Promise<boolean> {
 async function doFlush(): Promise<void> {
   if (flushInProgress || buffer.length === 0 || !config) return;
 
+  // Trial expired — silently discard all buffered events
+  if (trialExpired) {
+    buffer.length = 0;
+    return;
+  }
+
   flushInProgress = true;
 
   try {
@@ -312,8 +363,14 @@ async function doFlush(): Promise<void> {
       buffer.splice(0, batchSize);
       retryBackoffMs = 1_000;
     } else {
-      setTimeout(() => void doFlush(), retryBackoffMs);
-      retryBackoffMs = Math.min(retryBackoffMs * 2, MAX_BACKOFF_MS);
+      // Write audit log if we've hit max retries (backoff maxed out)
+      if (retryBackoffMs >= MAX_BACKOFF_MS) {
+        writeAuditLog("max_retries_exceeded", batch.length, batch);
+        buffer.splice(0, batchSize); // drop after max retries
+      } else {
+        setTimeout(() => void doFlush(), retryBackoffMs);
+        retryBackoffMs = Math.min(retryBackoffMs * 2, MAX_BACKOFF_MS);
+      }
     }
   } catch (err) {
     console.error("[podwatch] Unexpected flush error:", err);
@@ -346,6 +403,7 @@ export const transmitter = {
     buffer = [];
     retryBackoffMs = 1_000;
     flushInProgress = false;
+    trialExpired = false;
     activateTs = Date.now();
     knownTools.clear();
     recentCredentialAccesses.length = 0;
@@ -502,5 +560,10 @@ export const transmitter = {
   /** Number of known tools (for testing/diagnostics). */
   get knownToolCount(): number {
     return knownTools.size;
+  },
+
+  /** Whether trial has expired (for testing). */
+  get isTrialExpired(): boolean {
+    return trialExpired;
   },
 };

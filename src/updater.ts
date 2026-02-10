@@ -3,21 +3,23 @@
  *
  * On plugin startup (called from register()), schedules a non-blocking update
  * check after a 30-second delay. If a new version is available on npm (or the
- * Podwatch dashboard fallback), it runs `openclaw plugins update podwatch` and
- * triggers a gateway restart via `openclaw gateway restart`.
+ * Podwatch dashboard fallback), it downloads via `npm pack`, extracts to the
+ * extensions directory, writes a restart sentinel, and triggers a gateway
+ * restart via the OS service manager (systemd / launchctl).
  *
  * Safety:
  * - 30s startup delay (don't slow boot)
  * - 24-hour cooldown between checks (cached in a local file)
  * - 5s timeout on all HTTP requests
- * - 60s timeout on update command
+ * - 120s timeout on npm pack command
  * - All errors caught — never bricks the running plugin
  * - Logs all activity for debugging
  */
 
-import { exec } from "node:child_process";
+import { execSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import os from "node:os";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -25,7 +27,8 @@ import path from "node:path";
 
 const NPM_REGISTRY_URL = "https://registry.npmjs.org/podwatch/latest";
 const CHECK_TIMEOUT_MS = 5_000;
-const UPDATE_TIMEOUT_MS = 60_000;
+const NPM_PACK_TIMEOUT_MS = 120_000;
+const SPAWN_TIMEOUT_MS = 15_000;
 const STARTUP_DELAY_MS = 30_000;
 const COOLDOWN_MS = 24 * 60 * 60 * 1000; // 24 hours
 
@@ -37,6 +40,62 @@ const CACHE_DIR = path.join(
 );
 
 export const AUTO_UPDATE_CACHE_FILE = path.join(CACHE_DIR, ".last-update-check");
+
+// ---------------------------------------------------------------------------
+// State dir resolution (mirrors OpenClaw's resolveStateDir)
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve the OpenClaw state directory.
+ * Checks OPENCLAW_STATE_DIR / CLAWDBOT_STATE_DIR env, then defaults to ~/.openclaw.
+ */
+export function resolveStateDir(): string {
+  const override = process.env.OPENCLAW_STATE_DIR?.trim() || process.env.CLAWDBOT_STATE_DIR?.trim();
+  if (override) return override;
+  const home = process.env.HOME ?? process.env.USERPROFILE ?? os.homedir();
+  return path.join(home, ".openclaw");
+}
+
+// ---------------------------------------------------------------------------
+// Service name resolution (mirrors OpenClaw's constants)
+// ---------------------------------------------------------------------------
+
+/**
+ * Normalize a gateway profile string. Returns null for empty/default.
+ */
+function normalizeGatewayProfile(profile: string | undefined): string | null {
+  const trimmed = profile?.trim();
+  if (!trimmed || trimmed.toLowerCase() === "default") return null;
+  return trimmed;
+}
+
+/**
+ * Resolve the systemd service name for the gateway.
+ */
+export function resolveGatewaySystemdServiceName(profile: string | undefined): string {
+  const normalized = normalizeGatewayProfile(profile);
+  const suffix = normalized ? `-${normalized}` : "";
+  if (!suffix) return "openclaw-gateway";
+  return `openclaw-gateway${suffix}`;
+}
+
+/**
+ * Resolve the launchd label for the gateway.
+ */
+export function resolveGatewayLaunchAgentLabel(profile: string | undefined): string {
+  const normalized = normalizeGatewayProfile(profile);
+  if (!normalized) return "ai.openclaw.gateway";
+  return `ai.openclaw.${normalized}`;
+}
+
+/**
+ * Normalize a systemd unit name. Appends .service if missing.
+ */
+export function normalizeSystemdUnit(raw: string | undefined, profile: string | undefined): string {
+  const unit = raw?.trim();
+  if (!unit) return `${resolveGatewaySystemdServiceName(profile)}.service`;
+  return unit.endsWith(".service") ? unit : `${unit}.service`;
+}
 
 // ---------------------------------------------------------------------------
 // Version comparison
@@ -164,7 +223,47 @@ export async function checkForUpdate(
 }
 
 // ---------------------------------------------------------------------------
-// Update execution
+// Restart sentinel
+// ---------------------------------------------------------------------------
+
+export interface RestartSentinelPayload {
+  kind: string;
+  status: string;
+  ts: number;
+  message: string;
+  doctorHint: string;
+}
+
+/**
+ * Write a restart sentinel file so the gateway knows why it was restarted.
+ * Mirrors OpenClaw's writeRestartSentinel from src/infra/restart-sentinel.ts.
+ */
+export function writeRestartSentinel(version: string): string {
+  const stateDir = resolveStateDir();
+  const sentinelPath = path.join(stateDir, "state", "restart-sentinel.json");
+  const data = {
+    version: 1,
+    payload: {
+      kind: "update",
+      status: "ok",
+      ts: Date.now(),
+      message: `Podwatch plugin updated to v${version}`,
+      doctorHint: "Run: openclaw doctor --non-interactive",
+    },
+  };
+
+  try {
+    fs.mkdirSync(path.dirname(sentinelPath), { recursive: true });
+    fs.writeFileSync(sentinelPath, `${JSON.stringify(data, null, 2)}\n`, "utf-8");
+    return sentinelPath;
+  } catch (err) {
+    console.warn("[podwatch/updater] Failed to write restart sentinel:", err);
+    return sentinelPath;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Update execution (npm pack + extract)
 // ---------------------------------------------------------------------------
 
 export interface UpdateResult {
@@ -175,48 +274,209 @@ export interface UpdateResult {
 }
 
 /**
- * Run `openclaw plugins update podwatch` via child_process.exec.
+ * Download and install the latest podwatch plugin via npm pack + extract.
+ *
+ * Steps:
+ * 1. `npm pack podwatch` in a temp dir to get the tarball
+ * 2. Clean old dist in the extensions directory
+ * 3. Extract tarball contents to ~/.openclaw/extensions/podwatch/
  */
-export function executeUpdate(): Promise<UpdateResult> {
-  return new Promise((resolve) => {
-    exec(
-      "openclaw plugins update podwatch",
-      { timeout: UPDATE_TIMEOUT_MS },
-      (err, stdout, stderr) => {
-        if (err) {
-          resolve({
-            success: false,
-            stdout: stdout?.toString(),
-            stderr: stderr?.toString(),
-            error: err.message,
-          });
-        } else {
-          resolve({
-            success: true,
-            stdout: stdout?.toString(),
-            stderr: stderr?.toString(),
-          });
-        }
+export function executeUpdate(): UpdateResult {
+  const extensionsDir = path.join(
+    process.env.HOME ?? process.env.USERPROFILE ?? "/tmp",
+    ".openclaw",
+    "extensions",
+    "podwatch"
+  );
+
+  let tmpDir: string | null = null;
+
+  try {
+    // 1. Create temp dir for npm pack
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "podwatch-update-"));
+
+    // 2. npm pack podwatch (downloads latest from registry)
+    const packResult = spawnSync("npm", ["pack", "podwatch", "--pack-destination", tmpDir], {
+      encoding: "utf8",
+      timeout: NPM_PACK_TIMEOUT_MS,
+      cwd: tmpDir,
+    });
+
+    if (packResult.error || packResult.status !== 0) {
+      return {
+        success: false,
+        stdout: packResult.stdout,
+        stderr: packResult.stderr,
+        error: packResult.error?.message ?? `npm pack exited with status ${packResult.status}`,
+      };
+    }
+
+    // Find the tarball filename from stdout (npm pack prints the filename)
+    const tarballName = packResult.stdout.trim().split("\n").pop()?.trim();
+    if (!tarballName) {
+      return {
+        success: false,
+        stdout: packResult.stdout,
+        error: "npm pack did not output a tarball filename",
+      };
+    }
+
+    const tarballPath = path.join(tmpDir, tarballName);
+
+    // 3. Clean old dist before extracting
+    const distDir = path.join(extensionsDir, "dist");
+    if (fs.existsSync(distDir)) {
+      fs.rmSync(distDir, { recursive: true, force: true });
+    }
+
+    // 4. Ensure extensions dir exists
+    fs.mkdirSync(extensionsDir, { recursive: true });
+
+    // 5. Extract tarball — npm pack creates tarballs with a "package/" prefix
+    const extractResult = spawnSync(
+      "tar",
+      ["xzf", tarballPath, "--strip-components=1", "-C", extensionsDir],
+      {
+        encoding: "utf8",
+        timeout: 30_000,
       }
     );
-  });
+
+    if (extractResult.error || extractResult.status !== 0) {
+      return {
+        success: false,
+        stdout: extractResult.stdout,
+        stderr: extractResult.stderr,
+        error: extractResult.error?.message ?? `tar extract exited with status ${extractResult.status}`,
+      };
+    }
+
+    return {
+      success: true,
+      stdout: `Updated podwatch from ${tarballName}`,
+    };
+  } catch (err) {
+    return {
+      success: false,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  } finally {
+    // Cleanup temp dir
+    if (tmpDir) {
+      try {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      } catch {
+        // Best-effort cleanup
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Gateway restart via OS service manager
+// ---------------------------------------------------------------------------
+
+export interface RestartResult {
+  ok: boolean;
+  method: string;
+  detail?: string;
+  tried: string[];
 }
 
 /**
- * Trigger a gateway restart after update.
- * Uses `openclaw gateway restart` which sends SIGUSR1 for a hot-reload.
+ * Trigger a gateway restart using the OS service manager directly.
+ * Mirrors OpenClaw's triggerOpenClawRestart logic.
+ *
+ * Linux: systemctl --user restart <unit> (user first, then system fallback)
+ * macOS: launchctl kickstart -k gui/<uid>/<label>
+ * Fallback: log a manual restart message
  */
-function triggerGatewayRestart(): void {
-  exec("openclaw gateway restart", { timeout: 30_000 }, (err) => {
-    if (err) {
-      console.error("[podwatch/updater] Gateway restart failed:", err.message);
-      console.info(
-        "[podwatch/updater] Plugin updated but restart failed. Manual restart required."
-      );
-    } else {
-      console.info("[podwatch/updater] Gateway restart triggered.");
+export function triggerGatewayRestart(
+  logger: { info: (msg: string) => void; warn: (msg: string) => void; error: (msg: string) => void }
+): RestartResult {
+  const tried: string[] = [];
+
+  if (process.platform === "linux") {
+    const unit = normalizeSystemdUnit(
+      process.env.OPENCLAW_SYSTEMD_UNIT,
+      process.env.OPENCLAW_PROFILE
+    );
+
+    // Try user-level systemctl first
+    const userArgs = ["--user", "restart", unit];
+    tried.push(`systemctl ${userArgs.join(" ")}`);
+    const userRestart = spawnSync("systemctl", userArgs, {
+      encoding: "utf8",
+      timeout: SPAWN_TIMEOUT_MS,
+    });
+
+    if (!userRestart.error && userRestart.status === 0) {
+      logger.info("[podwatch/updater] Gateway restarted via systemctl --user.");
+      return { ok: true, method: "systemd", tried };
     }
-  });
+
+    // Fall back to system-level systemctl
+    const systemArgs = ["restart", unit];
+    tried.push(`systemctl ${systemArgs.join(" ")}`);
+    const systemRestart = spawnSync("systemctl", systemArgs, {
+      encoding: "utf8",
+      timeout: SPAWN_TIMEOUT_MS,
+    });
+
+    if (!systemRestart.error && systemRestart.status === 0) {
+      logger.info("[podwatch/updater] Gateway restarted via systemctl (system).");
+      return { ok: true, method: "systemd", tried };
+    }
+
+    // Both failed
+    const detail = [
+      `user: ${userRestart.error?.message ?? `exit ${userRestart.status}`}`,
+      `system: ${systemRestart.error?.message ?? `exit ${systemRestart.status}`}`,
+    ].join("; ");
+
+    logger.error(
+      `[podwatch/updater] systemctl restart failed: ${detail}. Please restart the gateway manually.`
+    );
+    return { ok: false, method: "systemd", detail, tried };
+  }
+
+  if (process.platform === "darwin") {
+    const label =
+      process.env.OPENCLAW_LAUNCHD_LABEL ||
+      resolveGatewayLaunchAgentLabel(process.env.OPENCLAW_PROFILE);
+
+    const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+    const target = uid !== undefined ? `gui/${uid}/${label}` : label;
+    const args = ["kickstart", "-k", target];
+    tried.push(`launchctl ${args.join(" ")}`);
+
+    const res = spawnSync("launchctl", args, {
+      encoding: "utf8",
+      timeout: SPAWN_TIMEOUT_MS,
+    });
+
+    if (!res.error && res.status === 0) {
+      logger.info("[podwatch/updater] Gateway restarted via launchctl.");
+      return { ok: true, method: "launchctl", tried };
+    }
+
+    const detail = res.error?.message ?? `exit ${res.status}`;
+    logger.error(
+      `[podwatch/updater] launchctl restart failed: ${detail}. Please restart the gateway manually.`
+    );
+    return { ok: false, method: "launchctl", detail, tried };
+  }
+
+  // Unsupported platform
+  logger.warn(
+    `[podwatch/updater] Unsupported platform "${process.platform}" for auto-restart. Please restart the gateway manually.`
+  );
+  return {
+    ok: false,
+    method: "unsupported",
+    detail: `unsupported platform: ${process.platform}`,
+    tried,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -249,7 +509,7 @@ export function scheduleUpdateCheck(
 /**
  * Internal: perform the actual update check + install + restart.
  */
-async function runUpdateCheck(
+export async function runUpdateCheck(
   currentVersion: string,
   endpoint: string,
   logger: { info: (msg: string) => void; warn: (msg: string) => void; error: (msg: string) => void }
@@ -285,7 +545,7 @@ async function runUpdateCheck(
       `[podwatch/updater] Update available: v${currentVersion} → v${result.remoteVersion} (via ${result.source}). Installing...`
     );
 
-    const updateResult = await executeUpdate();
+    const updateResult = executeUpdate();
 
     if (!updateResult.success) {
       logger.error(
@@ -298,11 +558,14 @@ async function runUpdateCheck(
     }
 
     logger.info(
-      `[podwatch/updater] Update installed successfully. Triggering gateway restart...`
+      `[podwatch/updater] Update installed successfully. Writing sentinel and triggering restart...`
     );
 
-    // Trigger restart — the session will recover automatically
-    triggerGatewayRestart();
+    // Write restart sentinel so the gateway knows why it restarted
+    writeRestartSentinel(result.remoteVersion);
+
+    // Trigger restart via OS service manager
+    triggerGatewayRestart(logger);
   } catch (err) {
     // Catch-all: never let the updater crash the plugin
     console.error("[podwatch/updater] Unexpected error:", err);
