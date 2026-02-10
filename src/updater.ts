@@ -17,6 +17,7 @@
  */
 
 import { execSync, spawnSync } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -168,6 +169,8 @@ export interface UpdateCheckResult {
   available: boolean;
   remoteVersion: string;
   source: "npm" | "dashboard";
+  /** SHA-256 hash of the expected tarball (from server). Undefined if not provided. */
+  sha256?: string;
 }
 
 /**
@@ -184,13 +187,14 @@ export async function checkForUpdate(
       signal: AbortSignal.timeout(CHECK_TIMEOUT_MS),
     });
     if (resp.ok) {
-      const data = (await resp.json()) as { version?: string };
+      const data = (await resp.json()) as { version?: string; sha256?: string };
       if (typeof data.version === "string" && data.version) {
         const cmp = compareVersions(currentVersion, data.version);
         return {
           available: cmp > 0,
           remoteVersion: data.version,
           source: "npm",
+          sha256: typeof data.sha256 === "string" ? data.sha256 : undefined,
         };
       }
     }
@@ -205,13 +209,14 @@ export async function checkForUpdate(
       signal: AbortSignal.timeout(CHECK_TIMEOUT_MS),
     });
     if (resp.ok) {
-      const data = (await resp.json()) as { version?: string };
+      const data = (await resp.json()) as { version?: string; sha256?: string };
       if (typeof data.version === "string" && data.version) {
         const cmp = compareVersions(currentVersion, data.version);
         return {
           available: cmp > 0,
           remoteVersion: data.version,
           source: "dashboard",
+          sha256: typeof data.sha256 === "string" ? data.sha256 : undefined,
         };
       }
     }
@@ -263,6 +268,35 @@ export function writeRestartSentinel(version: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// Tarball integrity verification
+// ---------------------------------------------------------------------------
+
+export interface IntegrityResult {
+  valid: boolean;
+  actualHash?: string;
+  error?: string;
+}
+
+/**
+ * Verify the SHA-256 hash of a tarball against an expected hash.
+ */
+export function verifyTarballIntegrity(tarballPath: string, expectedHash: string): IntegrityResult {
+  try {
+    const content = fs.readFileSync(tarballPath);
+    const actualHash = crypto.createHash("sha256").update(content).digest("hex");
+    return {
+      valid: actualHash === expectedHash,
+      actualHash,
+    };
+  } catch (err) {
+    return {
+      valid: false,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Update execution (npm pack + extract)
 // ---------------------------------------------------------------------------
 
@@ -271,24 +305,15 @@ export interface UpdateResult {
   stdout?: string;
   stderr?: string;
   error?: string;
+  /** Path to the downloaded tarball (available even on extract failure). */
+  tarballPath?: string;
 }
 
 /**
- * Download and install the latest podwatch plugin via npm pack + extract.
- *
- * Steps:
- * 1. `npm pack podwatch` in a temp dir to get the tarball
- * 2. Clean old dist in the extensions directory
- * 3. Extract tarball contents to ~/.openclaw/extensions/podwatch/
+ * Download the latest podwatch tarball via npm pack.
+ * Returns the tarball path on success for integrity verification.
  */
-export function executeUpdate(): UpdateResult {
-  const extensionsDir = path.join(
-    process.env.HOME ?? process.env.USERPROFILE ?? "/tmp",
-    ".openclaw",
-    "extensions",
-    "podwatch"
-  );
-
+export function downloadTarball(): UpdateResult & { tmpDir?: string } {
   let tmpDir: string | null = null;
 
   try {
@@ -308,6 +333,7 @@ export function executeUpdate(): UpdateResult {
         stdout: packResult.stdout,
         stderr: packResult.stderr,
         error: packResult.error?.message ?? `npm pack exited with status ${packResult.status}`,
+        tmpDir,
       };
     }
 
@@ -318,21 +344,49 @@ export function executeUpdate(): UpdateResult {
         success: false,
         stdout: packResult.stdout,
         error: "npm pack did not output a tarball filename",
+        tmpDir,
       };
     }
 
     const tarballPath = path.join(tmpDir, tarballName);
 
-    // 3. Clean old dist before extracting
+    return {
+      success: true,
+      stdout: `Downloaded ${tarballName}`,
+      tarballPath,
+      tmpDir,
+    };
+  } catch (err) {
+    return {
+      success: false,
+      error: err instanceof Error ? err.message : String(err),
+      tmpDir: tmpDir ?? undefined,
+    };
+  }
+}
+
+/**
+ * Install from a previously downloaded tarball by extracting to the extensions dir.
+ */
+export function installFromTarball(tarballPath: string): UpdateResult {
+  const extensionsDir = path.join(
+    process.env.HOME ?? process.env.USERPROFILE ?? "/tmp",
+    ".openclaw",
+    "extensions",
+    "podwatch"
+  );
+
+  try {
+    // 1. Clean old dist before extracting
     const distDir = path.join(extensionsDir, "dist");
     if (fs.existsSync(distDir)) {
       fs.rmSync(distDir, { recursive: true, force: true });
     }
 
-    // 4. Ensure extensions dir exists
+    // 2. Ensure extensions dir exists
     fs.mkdirSync(extensionsDir, { recursive: true });
 
-    // 5. Extract tarball — npm pack creates tarballs with a "package/" prefix
+    // 3. Extract tarball — npm pack creates tarballs with a "package/" prefix
     const extractResult = spawnSync(
       "tar",
       ["xzf", tarballPath, "--strip-components=1", "-C", extensionsDir],
@@ -351,6 +405,7 @@ export function executeUpdate(): UpdateResult {
       };
     }
 
+    const tarballName = path.basename(tarballPath);
     return {
       success: true,
       stdout: `Updated podwatch from ${tarballName}`,
@@ -360,11 +415,36 @@ export function executeUpdate(): UpdateResult {
       success: false,
       error: err instanceof Error ? err.message : String(err),
     };
+  }
+}
+
+/**
+ * Download and install the latest podwatch plugin via npm pack + extract.
+ * Legacy single-step function — delegates to downloadTarball + installFromTarball.
+ *
+ * Steps:
+ * 1. `npm pack podwatch` in a temp dir to get the tarball
+ * 2. Clean old dist in the extensions directory
+ * 3. Extract tarball contents to ~/.openclaw/extensions/podwatch/
+ */
+export function executeUpdate(): UpdateResult {
+  const download = downloadTarball();
+  try {
+    if (!download.success || !download.tarballPath) {
+      return {
+        success: false,
+        stdout: download.stdout,
+        stderr: download.stderr,
+        error: download.error ?? "Download failed",
+      };
+    }
+
+    return installFromTarball(download.tarballPath);
   } finally {
     // Cleanup temp dir
-    if (tmpDir) {
+    if (download.tmpDir) {
       try {
-        fs.rmSync(tmpDir, { recursive: true, force: true });
+        fs.rmSync(download.tmpDir, { recursive: true, force: true });
       } catch {
         // Best-effort cleanup
       }
@@ -480,6 +560,15 @@ export function triggerGatewayRestart(
 }
 
 // ---------------------------------------------------------------------------
+// Update options
+// ---------------------------------------------------------------------------
+
+export interface UpdateOptions {
+  /** Enable auto-update. Default: false (opt-in). */
+  autoUpdate?: boolean;
+}
+
+// ---------------------------------------------------------------------------
 // Main entry point (called from register())
 // ---------------------------------------------------------------------------
 
@@ -487,17 +576,21 @@ export function triggerGatewayRestart(
  * Schedule a non-blocking update check 30s after startup.
  * Safe to call synchronously — it sets a timer and returns immediately.
  *
+ * Auto-update is opt-in: only runs if options.autoUpdate is explicitly true.
+ *
  * @param currentVersion The plugin's current version from package.json
  * @param endpoint The Podwatch API endpoint (for dashboard fallback)
  * @param logger The plugin logger (api.logger)
+ * @param options Update options (autoUpdate, etc.)
  */
 export function scheduleUpdateCheck(
   currentVersion: string,
   endpoint: string,
-  logger: { info: (msg: string) => void; warn: (msg: string) => void; error: (msg: string) => void }
+  logger: { info: (msg: string) => void; warn: (msg: string) => void; error: (msg: string) => void },
+  options: UpdateOptions = {}
 ): void {
   const timer = setTimeout(() => {
-    void runUpdateCheck(currentVersion, endpoint, logger);
+    void runUpdateCheck(currentVersion, endpoint, logger, options);
   }, STARTUP_DELAY_MS);
 
   // Don't hold the process open for this timer
@@ -508,14 +601,31 @@ export function scheduleUpdateCheck(
 
 /**
  * Internal: perform the actual update check + install + restart.
+ *
+ * Flow:
+ * 1. Check autoUpdate opt-in (default false)
+ * 2. Respect 24h cooldown
+ * 3. Check for newer version (npm → dashboard fallback)
+ * 4. Require integrity hash from server (skip if missing)
+ * 5. Download tarball via npm pack
+ * 6. Verify tarball SHA-256 against server hash
+ * 7. Extract and install
+ * 8. Write restart sentinel + trigger gateway restart
  */
 export async function runUpdateCheck(
   currentVersion: string,
   endpoint: string,
-  logger: { info: (msg: string) => void; warn: (msg: string) => void; error: (msg: string) => void }
+  logger: { info: (msg: string) => void; warn: (msg: string) => void; error: (msg: string) => void },
+  options: UpdateOptions = {}
 ): Promise<void> {
   try {
-    // Respect 24h cooldown
+    // 1. Check opt-in — auto-update must be explicitly enabled
+    if (options.autoUpdate !== true) {
+      logger.info("[podwatch/updater] Auto-update is disabled. Set autoUpdate: true in plugin config to enable.");
+      return;
+    }
+
+    // 2. Respect 24h cooldown
     if (!shouldCheckForUpdate()) {
       console.log("[podwatch/updater] Skipping check — within 24h cooldown.");
       return;
@@ -540,32 +650,86 @@ export async function runUpdateCheck(
       return;
     }
 
-    // New version available!
+    // 3. Require integrity hash from server
+    if (!result.sha256) {
+      logger.warn(
+        `[podwatch/updater] No integrity hash available for v${result.remoteVersion} (via ${result.source}). ` +
+          "Skipping update for security. The server must provide a sha256 hash."
+      );
+      return;
+    }
+
+    // New version available with integrity hash!
     logger.info(
-      `[podwatch/updater] Update available: v${currentVersion} → v${result.remoteVersion} (via ${result.source}). Installing...`
+      `[podwatch/updater] Update available: v${currentVersion} → v${result.remoteVersion} (via ${result.source}). Downloading...`
     );
 
-    const updateResult = executeUpdate();
+    // 4. Download tarball
+    const download = downloadTarball();
 
-    if (!updateResult.success) {
+    if (!download.success || !download.tarballPath) {
       logger.error(
-        `[podwatch/updater] Update failed: ${updateResult.error}. Continuing with current version.`
+        `[podwatch/updater] Update failed: ${download.error}. Continuing with current version.`
       );
-      if (updateResult.stderr) {
-        console.error("[podwatch/updater] stderr:", updateResult.stderr);
+      if (download.stderr) {
+        console.error("[podwatch/updater] stderr:", download.stderr);
+      }
+      // Cleanup temp dir
+      if (download.tmpDir) {
+        try { fs.rmSync(download.tmpDir, { recursive: true, force: true }); } catch { /* best-effort */ }
       }
       return;
     }
 
-    logger.info(
-      `[podwatch/updater] Update installed successfully. Writing sentinel and triggering restart...`
-    );
+    try {
+      // 5. Verify tarball integrity
+      const integrity = verifyTarballIntegrity(download.tarballPath, result.sha256);
 
-    // Write restart sentinel so the gateway knows why it restarted
-    writeRestartSentinel(result.remoteVersion);
+      logger.info(
+        `[podwatch/updater] Package sha256: ${integrity.actualHash ?? "unknown"}`
+      );
 
-    // Trigger restart via OS service manager
-    triggerGatewayRestart(logger);
+      if (!integrity.valid) {
+        logger.error(
+          `[podwatch/updater] Tarball integrity check failed! ` +
+            `Expected: ${result.sha256}, Got: ${integrity.actualHash ?? integrity.error}. ` +
+            "Update aborted — possible supply chain attack."
+        );
+        return;
+      }
+
+      logger.info(
+        `[podwatch/updater] Integrity verified (sha256: ${integrity.actualHash}). Installing v${result.remoteVersion}...`
+      );
+
+      // 6. Extract and install
+      const installResult = installFromTarball(download.tarballPath);
+
+      if (!installResult.success) {
+        logger.error(
+          `[podwatch/updater] Update failed: ${installResult.error}. Continuing with current version.`
+        );
+        if (installResult.stderr) {
+          console.error("[podwatch/updater] stderr:", installResult.stderr);
+        }
+        return;
+      }
+
+      logger.info(
+        `[podwatch/updater] Update installed successfully (v${currentVersion} → v${result.remoteVersion}). Writing sentinel and triggering restart...`
+      );
+
+      // 7. Write restart sentinel so the gateway knows why it restarted
+      writeRestartSentinel(result.remoteVersion);
+
+      // 8. Trigger restart via OS service manager
+      triggerGatewayRestart(logger);
+    } finally {
+      // Cleanup temp dir
+      if (download.tmpDir) {
+        try { fs.rmSync(download.tmpDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+      }
+    }
   } catch (err) {
     // Catch-all: never let the updater crash the plugin
     console.error("[podwatch/updater] Unexpected error:", err);

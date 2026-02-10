@@ -80,6 +80,8 @@ import {
   resolveGatewaySystemdServiceName,
   resolveGatewayLaunchAgentLabel,
   normalizeSystemdUnit,
+  runUpdateCheck,
+  verifyTarballIntegrity,
   AUTO_UPDATE_CACHE_FILE,
 } from "./updater.js";
 
@@ -821,5 +823,256 @@ describe("triggerGatewayRestart", () => {
       expect(result.ok).toBe(false);
       expect(result.method).toBe("unsupported");
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Auto-update opt-in (autoUpdate config option)
+// ---------------------------------------------------------------------------
+
+describe("runUpdateCheck — autoUpdate opt-in", () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    // Make shouldCheckForUpdate() return true (no cache file)
+    mockExistsSync.mockReturnValue(false);
+  });
+
+  it("does NOT run when autoUpdate is false (default)", async () => {
+    const logger = mockLogger();
+    await runUpdateCheck("1.0.0", "https://podwatch.app/api", logger, { autoUpdate: false });
+
+    // Should not even call fetch
+    expect(mockFetch).not.toHaveBeenCalled();
+    expect(logger.info).toHaveBeenCalledWith(
+      expect.stringContaining("Auto-update is disabled")
+    );
+  });
+
+  it("does NOT run when autoUpdate is undefined (default)", async () => {
+    const logger = mockLogger();
+    await runUpdateCheck("1.0.0", "https://podwatch.app/api", logger, {});
+
+    expect(mockFetch).not.toHaveBeenCalled();
+    expect(logger.info).toHaveBeenCalledWith(
+      expect.stringContaining("Auto-update is disabled")
+    );
+  });
+
+  it("runs when autoUpdate is explicitly true", async () => {
+    const logger = mockLogger();
+    // npm returns same version (no update)
+    mockFetch.mockResolvedValueOnce(jsonResponse({ version: "1.0.0" }));
+
+    await runUpdateCheck("1.0.0", "https://podwatch.app/api", logger, { autoUpdate: true });
+
+    // Should have called fetch (tried to check)
+    expect(mockFetch).toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tarball integrity verification
+// ---------------------------------------------------------------------------
+
+describe("verifyTarballIntegrity", () => {
+  it("returns true when tarball hash matches expected hash", () => {
+    // Create a known buffer and its SHA-256
+    const content = Buffer.from("test tarball content");
+    const crypto = require("node:crypto");
+    const expectedHash = crypto.createHash("sha256").update(content).digest("hex");
+
+    // Mock fs.readFileSync to return our known content
+    mockReadFileSync.mockReturnValueOnce(content);
+
+    const result = verifyTarballIntegrity("/tmp/test.tgz", expectedHash);
+    expect(result.valid).toBe(true);
+    expect(result.actualHash).toBe(expectedHash);
+  });
+
+  it("returns false when tarball hash does NOT match expected hash", () => {
+    const content = Buffer.from("test tarball content");
+    mockReadFileSync.mockReturnValueOnce(content);
+
+    const result = verifyTarballIntegrity("/tmp/test.tgz", "badhash123");
+    expect(result.valid).toBe(false);
+    expect(result.actualHash).toBeTruthy();
+    expect(result.actualHash).not.toBe("badhash123");
+  });
+
+  it("returns false when readFileSync throws", () => {
+    mockReadFileSync.mockImplementationOnce(() => {
+      throw new Error("ENOENT");
+    });
+
+    const result = verifyTarballIntegrity("/tmp/nonexistent.tgz", "somehash");
+    expect(result.valid).toBe(false);
+    expect(result.error).toContain("ENOENT");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Full update flow with integrity verification
+// ---------------------------------------------------------------------------
+
+describe("runUpdateCheck — integrity verification", () => {
+  const originalPlatform = process.platform;
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    // Make shouldCheckForUpdate() return true (no cache file)
+    mockExistsSync.mockReturnValue(false);
+    Object.defineProperty(process, "platform", { value: "linux" });
+  });
+
+  afterEach(() => {
+    Object.defineProperty(process, "platform", { value: originalPlatform });
+  });
+
+  it("verifies tarball hash against server-provided sha256", async () => {
+    const logger = mockLogger();
+    const crypto = require("node:crypto");
+    const tarballContent = Buffer.from("fake tarball");
+    const tarballHash = crypto.createHash("sha256").update(tarballContent).digest("hex");
+
+    // npm registry fails → fallback to dashboard
+    mockFetch.mockResolvedValueOnce(jsonResponse({}, 500));
+    // dashboard returns version + sha256
+    mockFetch.mockResolvedValueOnce(jsonResponse({ version: "1.1.0", sha256: tarballHash }));
+
+    // npm pack succeeds
+    mockMkdtempSync.mockReturnValue("/tmp/podwatch-update-abc");
+    mockSpawnSync
+      .mockReturnValueOnce({
+        error: null, status: 0,
+        stdout: "podwatch-1.1.0.tgz\n", stderr: "",
+      })
+      // tar extract succeeds
+      .mockReturnValueOnce({ error: null, status: 0, stdout: "", stderr: "" })
+      // systemctl restart
+      .mockReturnValueOnce({ error: null, status: 0, stdout: "", stderr: "" });
+
+    // Mock reading tarball for hash verification
+    mockReadFileSync.mockReturnValueOnce(tarballContent);
+
+    await runUpdateCheck("1.0.0", "https://podwatch.app/api", logger, { autoUpdate: true });
+
+    // Should have logged the hash
+    expect(logger.info).toHaveBeenCalledWith(
+      expect.stringContaining(tarballHash)
+    );
+  });
+
+  it("aborts update when tarball hash does NOT match server hash", async () => {
+    const logger = mockLogger();
+
+    // npm registry fails → fallback to dashboard
+    mockFetch.mockResolvedValueOnce(jsonResponse({}, 500));
+    // dashboard returns version + sha256
+    mockFetch.mockResolvedValueOnce(jsonResponse({ version: "1.1.0", sha256: "expected_hash_abc" }));
+
+    // npm pack succeeds
+    mockMkdtempSync.mockReturnValue("/tmp/podwatch-update-abc");
+    mockSpawnSync.mockReturnValueOnce({
+      error: null, status: 0,
+      stdout: "podwatch-1.1.0.tgz\n", stderr: "",
+    });
+
+    // Mock reading tarball — content won't match "expected_hash_abc"
+    mockReadFileSync.mockReturnValueOnce(Buffer.from("different content"));
+
+    await runUpdateCheck("1.0.0", "https://podwatch.app/api", logger, { autoUpdate: true });
+
+    // Should log integrity error
+    expect(logger.error).toHaveBeenCalledWith(
+      expect.stringContaining("integrity")
+    );
+    // Should NOT have called tar extract (update aborted before extraction)
+    const tarCalls = mockSpawnSync.mock.calls.filter(
+      (call: unknown[]) => call[0] === "tar"
+    );
+    expect(tarCalls).toHaveLength(0);
+  });
+
+  it("skips update with warning when server provides no sha256", async () => {
+    const logger = mockLogger();
+
+    // npm registry returns update (no sha256 from npm)
+    mockFetch.mockResolvedValueOnce(jsonResponse({ version: "1.1.0" }));
+
+    await runUpdateCheck("1.0.0", "https://podwatch.app/api", logger, { autoUpdate: true });
+
+    // Should log warning about missing hash
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("No integrity hash")
+    );
+    // Should NOT have called npm pack (update skipped)
+    const npmPackCalls = mockSpawnSync.mock.calls.filter(
+      (call: unknown[]) => call[0] === "npm"
+    );
+    expect(npmPackCalls).toHaveLength(0);
+  });
+
+  it("logs the downloaded package hash on successful update", async () => {
+    const logger = mockLogger();
+    const crypto = require("node:crypto");
+    const tarballContent = Buffer.from("real tarball bytes");
+    const tarballHash = crypto.createHash("sha256").update(tarballContent).digest("hex");
+
+    // npm registry fails → dashboard has hash
+    mockFetch.mockResolvedValueOnce(jsonResponse({}, 500));
+    mockFetch.mockResolvedValueOnce(jsonResponse({ version: "1.1.0", sha256: tarballHash }));
+
+    // npm pack succeeds
+    mockMkdtempSync.mockReturnValue("/tmp/podwatch-update-abc");
+    mockSpawnSync
+      .mockReturnValueOnce({
+        error: null, status: 0,
+        stdout: "podwatch-1.1.0.tgz\n", stderr: "",
+      })
+      // tar extract succeeds
+      .mockReturnValueOnce({ error: null, status: 0, stdout: "", stderr: "" })
+      // systemctl restart
+      .mockReturnValueOnce({ error: null, status: 0, stdout: "", stderr: "" });
+
+    // Mock reading tarball for hash verification
+    mockReadFileSync.mockReturnValueOnce(tarballContent);
+
+    await runUpdateCheck("1.0.0", "https://podwatch.app/api", logger, { autoUpdate: true });
+
+    // Should log the hash for audit trail
+    const hashLogCalls = logger.info.mock.calls.filter(
+      (call: string[]) => call[0].includes("sha256:")
+    );
+    expect(hashLogCalls.length).toBeGreaterThan(0);
+    expect(hashLogCalls[0][0]).toContain(tarballHash);
+  });
+
+  it("logs clearly what version is being installed", async () => {
+    const logger = mockLogger();
+    const crypto = require("node:crypto");
+    const tarballContent = Buffer.from("notification test");
+    const tarballHash = crypto.createHash("sha256").update(tarballContent).digest("hex");
+
+    // npm registry fails → dashboard has hash
+    mockFetch.mockResolvedValueOnce(jsonResponse({}, 500));
+    mockFetch.mockResolvedValueOnce(jsonResponse({ version: "2.0.0", sha256: tarballHash }));
+
+    mockMkdtempSync.mockReturnValue("/tmp/podwatch-update-abc");
+    mockSpawnSync
+      .mockReturnValueOnce({
+        error: null, status: 0,
+        stdout: "podwatch-2.0.0.tgz\n", stderr: "",
+      })
+      .mockReturnValueOnce({ error: null, status: 0, stdout: "", stderr: "" })
+      .mockReturnValueOnce({ error: null, status: 0, stdout: "", stderr: "" });
+
+    mockReadFileSync.mockReturnValueOnce(tarballContent);
+
+    await runUpdateCheck("1.0.0", "https://podwatch.app/api", logger, { autoUpdate: true });
+
+    // Should clearly log what's being installed
+    expect(logger.info).toHaveBeenCalledWith(
+      expect.stringContaining("v1.0.0 → v2.0.0")
+    );
   });
 });

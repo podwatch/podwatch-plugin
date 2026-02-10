@@ -28,6 +28,8 @@ export interface PodwatchConfig {
   endpoint?: string;
   enableBudgetEnforcement?: boolean;
   enableSecurityAlerts?: boolean;
+  /** Enable auto-update of the plugin. Default: false (opt-in for security). */
+  autoUpdate?: boolean;
   /** Pulse alive-ping interval in ms (default 300000 = 5 min). */
   pulseIntervalMs?: number;
   /** @deprecated Use pulseIntervalMs instead. Kept for backward compatibility. */
@@ -96,9 +98,10 @@ export default function register(api: any): void {
   registerLifecycleHandlers(api, config);
 
   // Schedule non-blocking auto-update check (30s after boot, 24h cooldown)
+  // Auto-update is opt-in (default false) for supply chain security.
   const currentVersion = api.version ?? "0.0.0";
   const endpoint = config.endpoint ?? "https://podwatch.app/api";
-  scheduleUpdateCheck(currentVersion, endpoint, api.logger);
+  scheduleUpdateCheck(currentVersion, endpoint, api.logger, { autoUpdate: config.autoUpdate });
 
   api.logger.info(
     `[podwatch] Plugin loaded (v${currentVersion}). Budget enforcement: ${config.enableBudgetEnforcement ? "ON" : "OFF"}, ` +
@@ -124,6 +127,7 @@ function resolveConfig(api: any): PodwatchConfig {
     endpoint: pluginConfig.endpoint ?? process.env.PODWATCH_ENDPOINT,
     enableBudgetEnforcement: pluginConfig.enableBudgetEnforcement ?? true,
     enableSecurityAlerts: pluginConfig.enableSecurityAlerts ?? true,
+    autoUpdate: pluginConfig.autoUpdate ?? false,
     // Backward compat: fall back to heartbeatIntervalMs if pulseIntervalMs not set
     pulseIntervalMs: pluginConfig.pulseIntervalMs ?? pluginConfig.heartbeatIntervalMs ?? 300_000,
     scanIntervalMs: pluginConfig.scanIntervalMs ?? 21_600_000, // 6 hours
