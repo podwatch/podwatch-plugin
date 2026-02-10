@@ -106,7 +106,7 @@ export function registerSecurityHandlers(api: any, config: PodwatchConfig): void
           severity: "critical",
           pattern: "exfiltration_sequence",
           toolName,
-          params: redactParams(params),
+          params: redactParams(params).result,
           triggerTool: credAccess?.toolName,
           triggerPath: credAccess?.path,
           sessionKey: ctx.sessionKey,
@@ -123,7 +123,7 @@ export function registerSecurityHandlers(api: any, config: PodwatchConfig): void
           severity: "high",
           pattern: "persistence_attempt",
           toolName,
-          params: redactParams(params),
+          params: redactParams(params).result,
           reason: classification.reason,
           sessionKey: ctx.sessionKey,
           agentId: ctx.agentId,
@@ -156,7 +156,7 @@ export function registerSecurityHandlers(api: any, config: PodwatchConfig): void
           severity: "high",
           pattern: "dangerous_operation",
           toolName,
-          params: redactParams(params),
+          params: redactParams(params).result,
           reason: classification.reason,
           sessionKey: ctx.sessionKey,
           agentId: ctx.agentId,
@@ -164,11 +164,13 @@ export function registerSecurityHandlers(api: any, config: PodwatchConfig): void
       }
 
       // --- C) Log ALL tool calls for timeline ---
+      const { result: redactedParams, redactedCount } = redactParams(params);
       transmitter.enqueue({
         type: "tool_call",
         ts: Date.now(),
         toolName,
-        params: redactParams(params),
+        params: redactedParams,
+        redactedCount,
         riskLevel: classification.riskLevel,
         sessionKey: ctx.sessionKey,
         agentId: ctx.agentId,

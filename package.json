@@ -18,6 +18,8 @@
     "build": "tsc",
     "dev": "tsc --watch",
     "clean": "rm -rf dist",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "prepublishOnly": "npm run build"
   },
   "engines": {
@@ -25,7 +27,9 @@
   },
   "openclaw": {
     "plugin": true,
-    "extensions": ["./dist/index.js"]
+    "extensions": [
+      "./dist/index.js"
+    ]
   },
   "keywords": [
     "openclaw",
@@ -45,6 +49,7 @@
   },
   "devDependencies": {
     "@types/node": "^25.2.1",
-    "typescript": "^5.7.0"
+    "typescript": "^5.7.0",
+    "vitest": "^4.0.18"
   }
 }
