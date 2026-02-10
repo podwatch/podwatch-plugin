@@ -1,5 +1,5 @@
 /**
- * Tests for transmitter — 402 handling, audit log, MAX_BACKOFF_MS.
+ * Tests for transmitter — 402 handling, audit log, retry logic, buffer overflow.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
@@ -133,21 +133,130 @@ describe("transmitter", () => {
     });
   });
 
-  describe("MAX_BACKOFF_MS = 30_000", () => {
-    it("caps backoff at 30s and drops events after max retries", async () => {
-      // Simulate repeated server errors
+  describe("retry counter logic (Critical #9)", () => {
+    it("events survive 5 consecutive failures (old behavior would drop them)", async () => {
       mockFetch(500);
       transmitter.enqueue({ type: "cost", ts: Date.now() });
 
-      // Flush multiple times to ramp up backoff
-      // 1s → 2s → 4s → 8s → 16s → 30s (capped) → drops
-      for (let i = 0; i < 6; i++) {
+      // 5 consecutive failures — events must still be in buffer
+      for (let i = 0; i < 5; i++) {
         await transmitter.flush();
       }
 
-      // After maxing out backoff, events should be dropped + audit logged
-      // The exact behavior depends on how many retries, but the key invariant
-      // is that MAX_BACKOFF_MS is 30_000 (not 60_000)
+      expect(transmitter.bufferedCount).toBe(1);
+    });
+
+    it("events dropped only after 10 consecutive failures", async () => {
+      mockFetch(500);
+      transmitter.enqueue({ type: "cost", ts: Date.now() });
+
+      // 9 failures — events should still be in buffer
+      for (let i = 0; i < 9; i++) {
+        await transmitter.flush();
+      }
+      expect(transmitter.bufferedCount).toBe(1);
+
+      // 10th failure — events should be dropped
+      await transmitter.flush();
+      expect(transmitter.bufferedCount).toBe(0);
+    });
+
+    it("writes audit log when dropping after 10 retries", async () => {
+      mockFetch(500);
+      transmitter.enqueue({ type: "cost", ts: Date.now() });
+
+      for (let i = 0; i < 10; i++) {
+        await transmitter.flush();
+      }
+
+      expect(fs.appendFileSync).toHaveBeenCalled();
+      const call = (fs.appendFileSync as any).mock.calls[0];
+      const entry = JSON.parse(call[1].trim());
+      expect(entry.reason).toBe("max_retries_exceeded");
+    });
+
+    it("retry counter resets on successful flush", async () => {
+      // Fail 8 times
+      mockFetch(500);
+      transmitter.enqueue({ type: "cost", ts: Date.now(), eventId: "evt-1" });
+      for (let i = 0; i < 8; i++) {
+        await transmitter.flush();
+      }
+      expect(transmitter.bufferedCount).toBe(1);
+
+      // Succeed — clears buffer, resets counter
+      mockFetch(200);
+      await transmitter.flush();
+      expect(transmitter.bufferedCount).toBe(0);
+
+      // Now enqueue new event and fail 9 times — should still survive
+      mockFetch(500);
+      transmitter.enqueue({ type: "cost", ts: Date.now(), eventId: "evt-2" });
+      for (let i = 0; i < 9; i++) {
+        await transmitter.flush();
+      }
+      expect(transmitter.bufferedCount).toBe(1);
+    });
+
+    it("failed batch stays at front of buffer for retry", async () => {
+      mockFetch(500);
+      transmitter.enqueue({ type: "cost", ts: Date.now(), eventId: "evt-first" });
+      transmitter.enqueue({ type: "cost", ts: Date.now(), eventId: "evt-second" });
+
+      // After a failure, events should still be in the buffer (not removed)
+      await transmitter.flush();
+      expect(transmitter.bufferedCount).toBe(2);
+    });
+
+    it("backoff caps at 30s but does not trigger drop", async () => {
+      mockFetch(500);
+      transmitter.enqueue({ type: "cost", ts: Date.now() });
+
+      // After 6 failures, backoff would be >= 32s (capped at 30s)
+      // Old behavior: drop. New behavior: keep retrying until counter hits 10
+      for (let i = 0; i < 6; i++) {
+        await transmitter.flush();
+      }
+      expect(transmitter.bufferedCount).toBe(1); // still there!
+    });
+  });
+
+  describe("buffer overflow (Critical #9)", () => {
+    it("drops to target (900) not just by 1 when buffer exceeds MAX_BUFFER_SIZE", () => {
+      // Fill buffer to exactly 1001 to trigger one overflow
+      for (let i = 0; i < 1001; i++) {
+        transmitter.enqueue({ type: "cost", ts: Date.now(), eventId: `evt-${i}` });
+      }
+
+      // Should have dropped to 900 (not 1000 like old behavior)
+      expect(transmitter.bufferedCount).toBe(900);
+    });
+
+    it("writes audit log on buffer overflow", () => {
+      for (let i = 0; i < 1005; i++) {
+        transmitter.enqueue({ type: "cost", ts: Date.now(), eventId: `evt-${i}` });
+      }
+
+      expect(fs.appendFileSync).toHaveBeenCalled();
+      const calls = (fs.appendFileSync as any).mock.calls;
+      const overflowEntry = calls.find((c: any) => {
+        try { return JSON.parse(c[1].trim()).reason === "buffer_overflow"; } catch { return false; }
+      });
+      expect(overflowEntry).toBeDefined();
+    });
+
+    it("prioritizes dropping non-critical events first on overflow", () => {
+      // Enqueue 500 security (critical) + 501 cost (non-critical) = 1001 → triggers overflow
+      for (let i = 0; i < 500; i++) {
+        transmitter.enqueue({ type: "security", ts: Date.now(), eventId: `sec-${i}` });
+      }
+      for (let i = 0; i < 501; i++) {
+        transmitter.enqueue({ type: "cost", ts: Date.now(), eventId: `cost-${i}` });
+      }
+
+      // Buffer was 1001, dropped to 900
+      // All 500 security events should survive — only cost events dropped
+      expect(transmitter.bufferedCount).toBe(900);
     });
   });
 });

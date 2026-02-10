@@ -27,8 +27,11 @@ let buffer: PodwatchEvent[] = [];
 let flushTimer: ReturnType<typeof setInterval> | null = null;
 let flushInProgress = false;
 let retryBackoffMs = 1_000;
+let retryCount = 0;
 const MAX_BACKOFF_MS = 30_000;
+const MAX_RETRIES = 10;
 const MAX_BUFFER_SIZE = 1_000;
+const BUFFER_TARGET_SIZE = 900;
 const PLUGIN_VERSION = "0.1.0";
 
 // --- Trial expired flag ---
@@ -362,13 +365,17 @@ async function doFlush(): Promise<void> {
     if (success) {
       buffer.splice(0, batchSize);
       retryBackoffMs = 1_000;
+      retryCount = 0;
     } else {
-      // Write audit log if we've hit max retries (backoff maxed out)
-      if (retryBackoffMs >= MAX_BACKOFF_MS) {
+      retryCount++;
+      // Drop batch only after exhausting all retries
+      if (retryCount >= MAX_RETRIES) {
         writeAuditLog("max_retries_exceeded", batch.length, batch);
-        buffer.splice(0, batchSize); // drop after max retries
+        buffer.splice(0, batchSize);
+        retryBackoffMs = 1_000;
+        retryCount = 0;
       } else {
-        setTimeout(() => void doFlush(), retryBackoffMs);
+        // Keep events in buffer (don't splice) — retry on next flush
         retryBackoffMs = Math.min(retryBackoffMs * 2, MAX_BACKOFF_MS);
       }
     }
@@ -445,6 +452,7 @@ export const transmitter = {
     config = cfg;
     buffer = [];
     retryBackoffMs = 1_000;
+    retryCount = 0;
     flushInProgress = false;
     trialExpired = false;
     activateTs = Date.now();
@@ -471,17 +479,39 @@ export const transmitter = {
   enqueue(event: PodwatchEvent): void {
     buffer.push(event);
 
-    // Overflow protection — drop oldest non-critical events
+    // Overflow protection — drop non-critical events down to BUFFER_TARGET_SIZE
     if (buffer.length > MAX_BUFFER_SIZE) {
-      const idx = buffer.findIndex(
-        (e) =>
-          e.type !== "setup_warning" &&
-          e.type !== "security" &&
-          e.type !== "budget_blocked"
-      );
-      if (idx >= 0) {
+      const criticalTypes = new Set(["setup_warning", "security", "budget_blocked"]);
+      const dropCount = buffer.length - BUFFER_TARGET_SIZE;
+
+      // Collect indices of non-critical events (oldest first)
+      const nonCriticalIndices: number[] = [];
+      for (let i = 0; i < buffer.length && nonCriticalIndices.length < dropCount; i++) {
+        if (!criticalTypes.has(buffer[i]!.type)) {
+          nonCriticalIndices.push(i);
+        }
+      }
+
+      // If not enough non-critical events, also drop critical (oldest first)
+      if (nonCriticalIndices.length < dropCount) {
+        for (let i = 0; i < buffer.length && nonCriticalIndices.length < dropCount; i++) {
+          if (criticalTypes.has(buffer[i]!.type)) {
+            nonCriticalIndices.push(i);
+          }
+        }
+      }
+
+      // Remove in reverse order to preserve indices
+      const dropped: PodwatchEvent[] = [];
+      const indicesToDrop = nonCriticalIndices.sort((a, b) => b - a);
+      for (const idx of indicesToDrop) {
+        dropped.push(buffer[idx]!);
         buffer.splice(idx, 1);
-        console.warn("[podwatch] Buffer overflow: dropped 1 event");
+      }
+
+      if (dropped.length > 0) {
+        writeAuditLog("buffer_overflow", dropped.length, dropped);
+        console.warn(`[podwatch] Buffer overflow: dropped ${dropped.length} events (target: ${BUFFER_TARGET_SIZE})`);
       }
     }
 
