@@ -410,8 +410,10 @@ describe("looksLikeToken", () => {
 
 describe("isHighEntropySecret", () => {
   it("detects high-entropy random token", () => {
-    // Generate a diverse token with high entropy
-    expect(isHighEntropySecret("aB3kL9mN2xQ7pR4wT6yU1vZ")).toBe(true);
+    // Use a longer token (>32 chars) to hit the standard 4.5 threshold
+    expect(isHighEntropySecret("aB3kL9mN2xQ7pR4wT6yU1vZ8jH5cF0gD")).toBe(true);
+    // Short high-entropy strings (≤32 chars) require higher entropy (4.8) to avoid UUID false positives
+    expect(isHighEntropySecret("aB3kL9mN2xQ7pR4wT6yU1vZ")).toBe(false);
   });
 
   it("does NOT flag short strings", () => {

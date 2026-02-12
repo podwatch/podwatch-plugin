@@ -69,6 +69,29 @@ const SENSITIVE_KEYS = new Set([
   "hmac",
   "nonce",
   "salt",
+
+  // Provider-specific key names
+  "resendapikey",
+  "resend_api_key",
+  "inngestkey",
+  "inngest_signing_key",
+  "planetscaletoken",
+  "planetscale_token",
+  "railwaytoken",
+  "railway_token",
+  "renderkey",
+  "render_api_key",
+  "postmarktoken",
+  "postmark_server_token",
+  "postmark_api_token",
+  "lemonsqueezyapikey",
+  "lemon_squeezy_api_key",
+  "pineconeapikey",
+  "pinecone_api_key",
+  "weaviateapikey",
+  "weaviate_api_key",
+  "flyapitoken",
+  "fly_api_token",
 ]);
 
 // ---------------------------------------------------------------------------
@@ -156,6 +179,24 @@ const SENSITIVE_VALUE_PATTERNS: RegExp[] = [
 
   // --- Discord ---
   /[MN][A-Za-z0-9]{23,}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,}/, // Discord bot token
+
+  // --- Resend ---
+  /^re_[a-zA-Z0-9]{20,}/,                                 // Resend API key
+
+  // --- PlanetScale ---
+  /^pscale_(?:tkn|pw|oauth)_[a-zA-Z0-9_-]{20,}/,         // PlanetScale token/password
+
+  // --- Fly.io ---
+  /^fo1_[a-zA-Z0-9_-]{20,}/,                              // Fly.io token
+
+  // --- Render ---
+  /^rnd_[a-zA-Z0-9]{20,}/,                                // Render API key
+
+  // --- Inngest ---
+  /^signkey-[a-zA-Z0-9_-]{20,}/,                          // Inngest signing key
+
+  // --- Pinecone ---
+  /^pcsk_[a-zA-Z0-9_-]{20,}/,                             // Pinecone API key
 ];
 
 // ---------------------------------------------------------------------------
@@ -207,12 +248,22 @@ function looksLikeToken(s: string): boolean {
 }
 
 const ENTROPY_MIN_LENGTH = 20;
-const ENTROPY_THRESHOLD = 4.5;
+
+/**
+ * Length-based entropy thresholds.
+ * Short high-entropy strings (20-32 chars) are often UUIDs/hashes, not secrets.
+ * Longer strings need less entropy to be suspicious.
+ */
+function getEntropyThreshold(length: number): number {
+  if (length <= 32) return 4.8;   // Short: stricter (avoid UUID false positives)
+  if (length <= 64) return 4.5;   // Medium: standard
+  return 4.2;                      // Long: slightly relaxed (long random tokens)
+}
 
 function isHighEntropySecret(s: string): boolean {
   if (s.length < ENTROPY_MIN_LENGTH) return false;
   if (!looksLikeToken(s)) return false;
-  return shannonEntropy(s) >= ENTROPY_THRESHOLD;
+  return shannonEntropy(s) >= getEntropyThreshold(s.length);
 }
 
 // ---------------------------------------------------------------------------
@@ -232,6 +283,44 @@ export interface RedactResult {
 }
 
 // ---------------------------------------------------------------------------
+// Redaction audit mode (opt-in via PODWATCH_REDACTION_AUDIT env var)
+// ---------------------------------------------------------------------------
+
+const REDACTION_AUDIT = !!process.env.PODWATCH_REDACTION_AUDIT;
+
+/**
+ * Log fields that were NOT redacted so we can spot gaps.
+ * Shows field name + first 4 chars + entropy score without exposing actual values.
+ */
+function auditUnredactedFields(obj: Record<string, unknown>, prefix = ''): void {
+  if (!REDACTION_AUDIT) return;
+
+  for (const [key, value] of Object.entries(obj)) {
+    const fieldPath = prefix ? `${prefix}.${key}` : key;
+
+    if (typeof value === 'string') {
+      if (value !== REDACTED && !value.startsWith('[truncated]')) {
+        const preview = value.slice(0, 4);
+        const entropy = shannonEntropy(value).toFixed(2);
+        console.log(`[podwatch:audit] PASS field="${fieldPath}" preview="${preview}…" len=${value.length} entropy=${entropy}`);
+      }
+    } else if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
+      auditUnredactedFields(value as Record<string, unknown>, fieldPath);
+    } else if (Array.isArray(value)) {
+      value.forEach((item, i) => {
+        if (typeof item === 'string' && item !== REDACTED) {
+          const preview = item.slice(0, 4);
+          const entropy = shannonEntropy(item).toFixed(2);
+          console.log(`[podwatch:audit] PASS field="${fieldPath}[${i}]" preview="${preview}…" len=${item.length} entropy=${entropy}`);
+        } else if (item !== null && typeof item === 'object') {
+          auditUnredactedFields(item as Record<string, unknown>, `${fieldPath}[${i}]`);
+        }
+      });
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -242,6 +331,7 @@ export interface RedactResult {
 export function redactParams(params: Record<string, unknown>): RedactResult {
   const counter = { count: 0 };
   const result = redactObject(params, 0, counter);
+  auditUnredactedFields(result);
   return { result, redactedCount: counter.count };
 }
 
@@ -322,4 +412,4 @@ function redactObject(
 }
 
 // Export internals for testing
-export { shannonEntropy, looksLikeToken, isHighEntropySecret, SENSITIVE_VALUE_PATTERNS, SENSITIVE_KEYS };
+export { shannonEntropy, looksLikeToken, isHighEntropySecret, getEntropyThreshold, SENSITIVE_VALUE_PATTERNS, SENSITIVE_KEYS };
