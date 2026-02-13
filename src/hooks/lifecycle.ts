@@ -34,6 +34,53 @@ let pulseFailureCount = 0;
 const PULSE_FAILURE_THRESHOLD = 3; // Start backoff after N consecutive failures
 const PULSE_MAX_INTERVAL_MS = 3_600_000; // 60 min cap
 
+// Config change detection state
+let knownPrimaryModel: string | null = null;
+
+/**
+ * Read the primary model from the OpenClaw gateway config.
+ * Handles both string and object shapes for `agents.defaults.model`.
+ */
+function readPrimaryModel(api: any): string | null {
+  try {
+    const modelCfg = api.config?.agents?.defaults?.model;
+    if (!modelCfg) return null;
+    if (typeof modelCfg === "string") return modelCfg;
+    if (typeof modelCfg === "object" && modelCfg.primary) return String(modelCfg.primary);
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Check if the primary model changed and emit a config_change event if so.
+ */
+function checkModelConfigChange(api: any): void {
+  const currentModel = readPrimaryModel(api);
+  if (currentModel === knownPrimaryModel) return;
+
+  const previousValue = knownPrimaryModel;
+  knownPrimaryModel = currentModel;
+
+  // Don't emit on first read if null
+  if (currentModel === null && previousValue === null) return;
+
+  transmitter.enqueue({
+    type: "config_change",
+    ts: Date.now(),
+    field: "model.primary",
+    value: currentModel,
+    previousValue,
+    // Pass as params so they appear in toolArgs on the server
+    params: {
+      field: "model.primary",
+      value: currentModel,
+      previousValue,
+    },
+  });
+}
+
 /**
  * Register lifecycle hook handlers.
  */
@@ -51,8 +98,12 @@ export function registerLifecycleHandlers(api: any, config: PodwatchConfig): voi
   // Reset pulse backoff state
   pulseFailureCount = 0;
 
+  // Read initial primary model config and send config_change event
+  knownPrimaryModel = null; // Reset on re-register
+  checkModelConfigChange(api);
+
   // Send initial pulse right now
-  void sendPulseWithBackoff(endpoint, apiKey, basePulseIntervalMs);
+  void sendPulseWithBackoff(endpoint, apiKey, basePulseIntervalMs, api);
 
   // Initial skill/plugin scan — delayed 30s to let gateway fully settle
   const workspaceDir = api.config?.agents?.defaults?.workspace;
@@ -168,7 +219,12 @@ async function sendPulseWithBackoff(
   endpoint: string,
   apiKey: string,
   baseIntervalMs: number,
+  api?: any,
 ): Promise<void> {
+  // Check for config changes on each pulse
+  if (api) {
+    checkModelConfigChange(api);
+  }
   let success = false;
   try {
     const response = await fetch(`${endpoint}/pulse`, {
@@ -212,7 +268,7 @@ async function sendPulseWithBackoff(
   // Schedule next pulse
   if (pulseTimer) clearTimeout(pulseTimer);
   pulseTimer = setTimeout(
-    () => void sendPulseWithBackoff(endpoint, apiKey, baseIntervalMs),
+    () => void sendPulseWithBackoff(endpoint, apiKey, baseIntervalMs, api),
     nextIntervalMs,
   );
   if (pulseTimer && typeof pulseTimer === "object" && "unref" in pulseTimer) {
