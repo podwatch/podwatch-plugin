@@ -41,7 +41,7 @@
     "budget-enforcement"
   ],
   "author": "Rafael Urena",
-  "license": "MIT",
+  "license": "BSD-3-Clause",
   "homepage": "https://podwatch.app",
   "repository": {
     "type": "git",
