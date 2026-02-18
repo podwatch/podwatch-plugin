@@ -41,6 +41,9 @@ function makeApi() {
     on: (name: string, handler: Function) => {
       handlers[name] = handler;
     },
+    registerHook: (name: string, handler: Function, _opts?: any) => {
+      handlers[name] = handler;
+    },
     logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
     config: { agents: { defaults: { workspace: "/tmp/test" } } },
     _trigger: async (name: string, event: any, ctx?: any) => {

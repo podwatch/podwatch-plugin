@@ -131,9 +131,22 @@ export interface PluginLogger {
   error: (...args: unknown[]) => void;
 }
 
+export interface RegisterHookOpts {
+  /** Unique hook name (required). */
+  name: string;
+  /** Priority — lower numbers run first. Default: 100. */
+  priority?: number;
+}
+
 export interface PluginApi {
-  /** Subscribe to a hook event. */
+  /** @deprecated Use registerHook() instead. Kept for backward compat with pre-2026.2.17 gateways. */
   on: (event: PluginHookName | string, handler: (...args: unknown[]) => void | Promise<void>) => void;
+  /** Register a hook handler. `events` is a string or string[]. Requires opts.name. */
+  registerHook: (
+    events: PluginHookName | string | (PluginHookName | string)[],
+    handler: (...args: unknown[]) => unknown | Promise<unknown>,
+    opts: RegisterHookOpts,
+  ) => void;
   /** Structured logger provided by the gateway. */
   logger: PluginLogger;
   /** Full gateway config (agents, diagnostics, etc.). Typed loosely for nested access. */

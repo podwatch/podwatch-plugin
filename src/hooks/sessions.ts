@@ -17,7 +17,7 @@ export function registerSessionHandlers(api: any): void {
   // -----------------------------------------------------------------------
   // session_start
   // -----------------------------------------------------------------------
-  api.on(
+  api.registerHook(
     "session_start",
     async (event: SessionStartEvent, ctx: { agentId?: string; sessionId: string }): Promise<void> => {
       transmitter.enqueue({
@@ -27,13 +27,14 @@ export function registerSessionHandlers(api: any): void {
         resumedFrom: event.resumedFrom,
         agentId: ctx.agentId,
       });
-    }
+    },
+    { name: "podwatch-session-start" }
   );
 
   // -----------------------------------------------------------------------
   // session_end — includes loop detection
   // -----------------------------------------------------------------------
-  api.on(
+  api.registerHook(
     "session_end",
     async (event: SessionEndEvent, ctx: { agentId?: string; sessionId: string }): Promise<void> => {
       transmitter.enqueue({
@@ -57,7 +58,8 @@ export function registerSessionHandlers(api: any): void {
           agentId: ctx.agentId,
         });
       }
-    }
+    },
+    { name: "podwatch-session-end" }
   );
 
   api.logger.info("[podwatch/sessions] Session lifecycle handlers registered");

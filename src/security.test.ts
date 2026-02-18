@@ -41,6 +41,7 @@ describe("security hooks", () => {
   let afterToolCallHandler: (event: any, ctx: any) => Promise<any>;
   const mockApi = {
     on: vi.fn(),
+    registerHook: vi.fn(),
     logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
   };
   const defaultCtx = { sessionKey: "agent:main:interactive", agentId: "main" };
@@ -53,6 +54,7 @@ describe("security hooks", () => {
     mockIsKnownTool.mockReturnValue(false);
     mockGetAgentUptimeHours.mockReturnValue(0);
 
+    mockApi.registerHook.mockReset();
     mockApi.on.mockReset();
     registerSecurityHandlers(mockApi, {
       apiKey: "test",
@@ -60,8 +62,8 @@ describe("security hooks", () => {
       enableSecurityAlerts: true,
     });
 
-    // Extract registered handlers
-    const calls = mockApi.on.mock.calls;
+    // Extract registered handlers (now via registerHook)
+    const calls = mockApi.registerHook.mock.calls;
     const beforeCall = calls.find((c: any) => c[0] === "before_tool_call");
     const afterCall = calls.find((c: any) => c[0] === "after_tool_call");
     beforeToolCallHandler = beforeCall![1];
@@ -340,13 +342,14 @@ describe("security hooks", () => {
     let handler: (event: any, ctx: any) => Promise<any>;
 
     beforeEach(() => {
+      mockApi.registerHook.mockReset();
       mockApi.on.mockReset();
       registerSecurityHandlers(mockApi, {
         apiKey: "test",
         enableBudgetEnforcement: false,
         enableSecurityAlerts: false,
       });
-      const beforeCall = mockApi.on.mock.calls.find((c: any) => c[0] === "before_tool_call");
+      const beforeCall = mockApi.registerHook.mock.calls.find((c: any) => c[0] === "before_tool_call");
       handler = beforeCall![1];
     });
 

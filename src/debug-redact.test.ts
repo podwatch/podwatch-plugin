@@ -29,6 +29,7 @@ describe("debug logging redaction", () => {
   function makeApi(overrides?: Record<string, any>) {
     return {
       on: vi.fn(),
+      registerHook: vi.fn(),
       logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
       config: {
         diagnostics: { enabled: true },

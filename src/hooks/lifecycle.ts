@@ -126,18 +126,19 @@ export function registerLifecycleHandlers(api: any, config: PodwatchConfig): voi
   // -----------------------------------------------------------------------
   // gateway_start — best-effort re-scan (in case it ever fires)
   // -----------------------------------------------------------------------
-  api.on(
+  api.registerHook(
     "gateway_start",
     async (event: GatewayStartEvent): Promise<void> => {
       // Re-run scan as best-effort; pulse is already running
       void runScan(api.config?.agents?.defaults?.workspace);
-    }
+    },
+    { name: "podwatch-gateway-start" }
   );
 
   // -----------------------------------------------------------------------
   // gateway_stop — graceful shutdown
   // -----------------------------------------------------------------------
-  api.on(
+  api.registerHook(
     "gateway_stop",
     async (): Promise<void> => {
       // Stop intervals
@@ -160,13 +161,14 @@ export function registerLifecycleHandlers(api: any, config: PodwatchConfig): voi
       await transmitter.shutdown();
 
       api.logger.info("[podwatch/lifecycle] Graceful shutdown complete");
-    }
+    },
+    { name: "podwatch-gateway-stop" }
   );
 
   // -----------------------------------------------------------------------
   // before_compaction — context window pressure
   // -----------------------------------------------------------------------
-  api.on(
+  api.registerHook(
     "before_compaction",
     async (event: BeforeCompactionEvent, ctx: PluginHookAgentContext): Promise<void> => {
       transmitter.enqueue({
@@ -199,7 +201,8 @@ export function registerLifecycleHandlers(api: any, config: PodwatchConfig): voi
           });
         }
       }
-    }
+    },
+    { name: "podwatch-compaction" }
   );
 }
 

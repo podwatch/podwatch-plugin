@@ -32,7 +32,7 @@ export function registerSecurityHandlers(api: any, config: PodwatchConfig): void
   // -----------------------------------------------------------------------
   // before_tool_call — security scan + budget enforcement + exfiltration
   // -----------------------------------------------------------------------
-  api.on(
+  api.registerHook(
     "before_tool_call",
     async (
       event: BeforeToolCallEvent,
@@ -127,13 +127,13 @@ export function registerSecurityHandlers(api: any, config: PodwatchConfig): void
         agentId: ctx.agentId,
       });
     },
-    { priority: 10 } // Run early to block before other plugins
+    { name: "podwatch-security-scan", priority: 10 } // Run early to block before other plugins
   );
 
   // -----------------------------------------------------------------------
   // after_tool_call — latency + success/failure (fire-and-forget)
   // -----------------------------------------------------------------------
-  api.on(
+  api.registerHook(
     "after_tool_call",
     async (event: AfterToolCallEvent, ctx: PluginHookAgentContext): Promise<void> => {
       transmitter.enqueue({
@@ -146,7 +146,8 @@ export function registerSecurityHandlers(api: any, config: PodwatchConfig): void
         sessionKey: ctx.sessionKey,
         agentId: ctx.agentId,
       });
-    }
+    },
+    { name: "podwatch-tool-result" }
   );
 
   api.logger.info(
