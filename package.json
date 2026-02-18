@@ -1,7 +1,7 @@
 {
   "name": "podwatch",
   "version": "1.0.1",
-  "description": "Cost monitoring, budget enforcement, and security alerts for OpenClaw agents",
+  "description": "Security monitoring, cost tracking, and observability for AI agents",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "bin": {
@@ -34,6 +34,7 @@
   "keywords": [
     "openclaw",
     "openclaw-plugin",
+    "agent",
     "monitoring",
     "cost-tracking",
     "security",
@@ -45,7 +46,7 @@
   "homepage": "https://podwatch.app",
   "repository": {
     "type": "git",
-    "url": "https://github.com/jaime-perez-dev/podwatch-plugin"
+    "url": "https://github.com/podwatch/podwatch-plugin"
   },
   "devDependencies": {
     "@types/node": "^25.2.1",
