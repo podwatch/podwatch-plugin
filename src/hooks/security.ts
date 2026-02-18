@@ -32,7 +32,7 @@ export function registerSecurityHandlers(api: any, config: PodwatchConfig): void
   // -----------------------------------------------------------------------
   // before_tool_call — security scan + budget enforcement + exfiltration
   // -----------------------------------------------------------------------
-  api.registerHook(
+  api.on(
     "before_tool_call",
     async (
       event: BeforeToolCallEvent,
@@ -133,7 +133,7 @@ export function registerSecurityHandlers(api: any, config: PodwatchConfig): void
   // -----------------------------------------------------------------------
   // after_tool_call — latency + success/failure (fire-and-forget)
   // -----------------------------------------------------------------------
-  api.registerHook(
+  api.on(
     "after_tool_call",
     async (event: AfterToolCallEvent, ctx: PluginHookAgentContext): Promise<void> => {
       transmitter.enqueue({

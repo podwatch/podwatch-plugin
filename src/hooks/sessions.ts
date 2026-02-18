@@ -17,7 +17,7 @@ export function registerSessionHandlers(api: any): void {
   // -----------------------------------------------------------------------
   // session_start
   // -----------------------------------------------------------------------
-  api.registerHook(
+  api.on(
     "session_start",
     async (event: SessionStartEvent, ctx: { agentId?: string; sessionId: string }): Promise<void> => {
       transmitter.enqueue({
@@ -34,7 +34,7 @@ export function registerSessionHandlers(api: any): void {
   // -----------------------------------------------------------------------
   // session_end — includes loop detection
   // -----------------------------------------------------------------------
-  api.registerHook(
+  api.on(
     "session_end",
     async (event: SessionEndEvent, ctx: { agentId?: string; sessionId: string }): Promise<void> => {
       transmitter.enqueue({

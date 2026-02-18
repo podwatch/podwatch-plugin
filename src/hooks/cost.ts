@@ -40,7 +40,7 @@ export function registerCostHandler(
   diagnosticsEnabled: boolean
 ): void {
   // before_agent_start carries the full message history with usage on each assistant turn
-  api.registerHook("before_agent_start", async (event: any, ctx: any) => {
+  api.on("before_agent_start", async (event: any, ctx: any) => {
     if (!event?.messages || !Array.isArray(event.messages)) return;
 
     const sessionKey: string = ctx?.sessionKey ?? "__default__";
@@ -106,7 +106,7 @@ export function registerCostHandler(
   }, { name: "podwatch-cost" });
 
   // Clean up session index on session end to prevent memory leaks
-  api.registerHook("session_end", async (_event: any, ctx: any) => {
+  api.on("session_end", async (_event: any, ctx: any) => {
     const sessionKey: string = ctx?.sessionKey;
     if (sessionKey) {
       lastSeenIndexMap.delete(sessionKey);

@@ -126,7 +126,7 @@ export function registerLifecycleHandlers(api: any, config: PodwatchConfig): voi
   // -----------------------------------------------------------------------
   // gateway_start — best-effort re-scan (in case it ever fires)
   // -----------------------------------------------------------------------
-  api.registerHook(
+  api.on(
     "gateway_start",
     async (event: GatewayStartEvent): Promise<void> => {
       // Re-run scan as best-effort; pulse is already running
@@ -138,7 +138,7 @@ export function registerLifecycleHandlers(api: any, config: PodwatchConfig): voi
   // -----------------------------------------------------------------------
   // gateway_stop — graceful shutdown
   // -----------------------------------------------------------------------
-  api.registerHook(
+  api.on(
     "gateway_stop",
     async (): Promise<void> => {
       // Stop intervals
@@ -168,7 +168,7 @@ export function registerLifecycleHandlers(api: any, config: PodwatchConfig): voi
   // -----------------------------------------------------------------------
   // before_compaction — context window pressure
   // -----------------------------------------------------------------------
-  api.registerHook(
+  api.on(
     "before_compaction",
     async (event: BeforeCompactionEvent, ctx: PluginHookAgentContext): Promise<void> => {
       transmitter.enqueue({
