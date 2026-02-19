@@ -1,6 +1,6 @@
 {
   "name": "podwatch",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Security monitoring, cost tracking, and observability for AI agents",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

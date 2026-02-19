@@ -89,4 +89,4 @@ The installer adds this to `~/.openclaw/openclaw.json`:
 
 ## License
 
-MIT
+BSD-3-Clause
