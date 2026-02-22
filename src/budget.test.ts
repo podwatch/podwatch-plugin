@@ -1,6 +1,8 @@
 /**
- * Tests for budget hard stop hooks — before_model_resolve, before_prompt_build,
+ * Tests for budget hard stop hooks — before_prompt_build
  * and hard stop tool blocking in security.
+ *
+ * No model downgrade — we can't know what providers the user has configured.
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
@@ -11,15 +13,12 @@ vi.mock("./transmitter.js", () => ({ transmitter: mockTransmitter }));
 // Alias mock functions for readability in tests
 const mockEnqueue = mockTransmitter.enqueue;
 const mockGetCachedBudget = mockTransmitter.getCachedBudget;
-const mockMarkCredentialAccess = mockTransmitter.markCredentialAccess;
 const mockHasRecentCredentialAccess = mockTransmitter.hasRecentCredentialAccess;
 const mockGetRecentCredentialAccess = mockTransmitter.getRecentCredentialAccess;
 const mockIsKnownTool = mockTransmitter.isKnownTool;
-const mockRecordToolSeen = mockTransmitter.recordToolSeen;
 const mockGetAgentUptimeHours = mockTransmitter.getAgentUptimeHours;
-const mockUpdateBudgetFromResponse = mockTransmitter.updateBudgetFromResponse;
 
-import { registerBudgetHooks, findCheapestModel } from "./hooks/budget.js";
+import { registerBudgetHooks } from "./hooks/budget.js";
 import { registerSecurityHandlers } from "./hooks/security.js";
 
 // ---------------------------------------------------------------------------
@@ -35,212 +34,13 @@ function makeMockApi(config: Record<string, unknown> = {}) {
     logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
     config,
     pluginConfig: {},
-    version: "1.0.2",
+    version: "1.1.0",
     _hooks: hooks,
     _trigger: async (name: string, ...args: any[]) => {
       if (hooks[name]) return hooks[name](...args);
     },
   };
 }
-
-// ---------------------------------------------------------------------------
-// findCheapestModel (pure function)
-// ---------------------------------------------------------------------------
-describe("findCheapestModel", () => {
-  it("returns null when only one model is configured", () => {
-    const config = {
-      agents: { defaults: { model: { primary: "anthropic/opus" }, models: { "anthropic/opus": { alias: "opus" } } } },
-    };
-    expect(findCheapestModel(config)).toBeNull();
-  });
-
-  it("returns cheapest model from multiple options", () => {
-    const config = {
-      agents: {
-        defaults: {
-          model: { primary: "anthropic/claude-opus-4" },
-          models: {
-            "anthropic/claude-opus-4": { alias: "opus" },
-            "anthropic/claude-haiku-3": { alias: "haiku" },
-            "anthropic/claude-sonnet-4": { alias: "sonnet" },
-          },
-        },
-      },
-    };
-
-    const result = findCheapestModel(config);
-    expect(result).not.toBeNull();
-    // haiku is cheaper than sonnet and opus
-    expect(result!.model).toBe("anthropic/claude-haiku-3");
-  });
-
-  it("finds models from providers config", () => {
-    const config = {
-      models: {
-        providers: {
-          anthropic: { models: ["claude-opus-4", "claude-haiku-3"] },
-        },
-      },
-      agents: { defaults: { model: { primary: "anthropic/claude-opus-4" }, models: {} } },
-    };
-
-    const result = findCheapestModel(config);
-    expect(result).not.toBeNull();
-    expect(result!.model).toBe("anthropic/claude-haiku-3");
-  });
-
-  it("returns null for empty config", () => {
-    expect(findCheapestModel({})).toBeNull();
-  });
-
-  it("prefers haiku over flash over sonnet", () => {
-    const config = {
-      agents: {
-        defaults: {
-          model: { primary: "anthropic/claude-opus-4" },
-          models: {
-            "anthropic/claude-opus-4": {},
-            "google/gemini-flash": {},
-            "anthropic/claude-sonnet-4": {},
-            "anthropic/claude-haiku-3": {},
-          },
-        },
-      },
-    };
-
-    const result = findCheapestModel(config);
-    expect(result!.model).toBe("anthropic/claude-haiku-3");
-  });
-
-  it("does not return the current primary model as cheapest", () => {
-    const config = {
-      agents: {
-        defaults: {
-          model: { primary: "anthropic/claude-haiku-3" },
-          models: {
-            "anthropic/claude-haiku-3": {},
-            "anthropic/claude-sonnet-4": {},
-          },
-        },
-      },
-    };
-
-    const result = findCheapestModel(config);
-    expect(result).not.toBeNull();
-    expect(result!.model).toBe("anthropic/claude-sonnet-4");
-  });
-});
-
-// ---------------------------------------------------------------------------
-// before_model_resolve hook
-// ---------------------------------------------------------------------------
-describe("before_model_resolve", () => {
-  beforeEach(() => {
-    resetMockTransmitter();
-    mockGetCachedBudget.mockReturnValue(null);
-  });
-
-  it("returns model override when hard stop active and cheaper model exists", async () => {
-    mockGetCachedBudget.mockReturnValue({
-      limit: 10,
-      currentSpend: 10,
-      dailySpend: 10,
-      dailyLimit: 10,
-      monthlySpend: 50,
-      monthlyLimit: 100,
-      hardStopEnabled: true,
-      hardStopActive: true,
-      lastSyncTs: Date.now(),
-    });
-
-    const api = makeMockApi({
-      agents: {
-        defaults: {
-          model: { primary: "anthropic/claude-opus-4" },
-          models: {
-            "anthropic/claude-opus-4": { alias: "opus" },
-            "anthropic/claude-haiku-3": { alias: "haiku" },
-          },
-        },
-      },
-    });
-
-    registerBudgetHooks(api as any, { apiKey: "test", enableBudgetEnforcement: true });
-
-    const result = await api._trigger("before_model_resolve");
-    expect(result).toEqual({
-      modelOverride: "anthropic/claude-haiku-3",
-      providerOverride: "anthropic",
-    });
-  });
-
-  it("returns void when hard stop not active", async () => {
-    mockGetCachedBudget.mockReturnValue({
-      limit: 10,
-      currentSpend: 5,
-      dailySpend: 5,
-      dailyLimit: 10,
-      monthlySpend: 30,
-      monthlyLimit: 100,
-      hardStopEnabled: true,
-      hardStopActive: false,
-      lastSyncTs: Date.now(),
-    });
-
-    const api = makeMockApi({
-      agents: { defaults: { model: { primary: "opus" }, models: { opus: {}, haiku: {} } } },
-    });
-
-    registerBudgetHooks(api as any, { apiKey: "test", enableBudgetEnforcement: true });
-
-    const result = await api._trigger("before_model_resolve");
-    expect(result).toBeUndefined();
-  });
-
-  it("returns void when budget is null", async () => {
-    mockGetCachedBudget.mockReturnValue(null);
-
-    const api = makeMockApi({});
-    registerBudgetHooks(api as any, { apiKey: "test", enableBudgetEnforcement: true });
-
-    const result = await api._trigger("before_model_resolve");
-    expect(result).toBeUndefined();
-  });
-
-  it("returns void when only one model configured (no cheaper alternative)", async () => {
-    mockGetCachedBudget.mockReturnValue({
-      limit: 10, currentSpend: 10, dailySpend: 10, dailyLimit: 10,
-      monthlySpend: 50, monthlyLimit: 100,
-      hardStopEnabled: true, hardStopActive: true, lastSyncTs: Date.now(),
-    });
-
-    const api = makeMockApi({
-      agents: { defaults: { model: { primary: "anthropic/opus" }, models: { "anthropic/opus": {} } } },
-    });
-
-    registerBudgetHooks(api as any, { apiKey: "test", enableBudgetEnforcement: true });
-
-    const result = await api._trigger("before_model_resolve");
-    expect(result).toBeUndefined();
-  });
-
-  it("skips when budget enforcement disabled", async () => {
-    mockGetCachedBudget.mockReturnValue({
-      limit: 10, currentSpend: 10, dailySpend: 10, dailyLimit: 10,
-      monthlySpend: 50, monthlyLimit: 100,
-      hardStopEnabled: true, hardStopActive: true, lastSyncTs: Date.now(),
-    });
-
-    const api = makeMockApi({
-      agents: { defaults: { model: { primary: "opus" }, models: { opus: {}, haiku: {} } } },
-    });
-
-    registerBudgetHooks(api as any, { apiKey: "test", enableBudgetEnforcement: false });
-
-    const result = await api._trigger("before_model_resolve");
-    expect(result).toBeUndefined();
-  });
-});
 
 // ---------------------------------------------------------------------------
 // before_prompt_build hook
@@ -405,7 +205,6 @@ describe("hard stop tool blocking (security.ts)", () => {
       defaultCtx,
     );
 
-    // Should not block — no hard stop, spend below 95%
     expect(result?.block).not.toBe(true);
   });
 
