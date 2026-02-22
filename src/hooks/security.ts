@@ -8,8 +8,8 @@
  * - B3) Log ALL tool calls with redacted params (server classifies risk)
  *
  * after_tool_call: Fire-and-forget.
- * - Latency tracking (durationMs)
- * - Success/failure recording
+ * - Latency tracking (duration + success/failure)
+ * - Correlation with the original tool_call via correlationId
  */
 
 import type { PodwatchConfig } from "../index.js";
@@ -24,6 +24,44 @@ import { redactParams } from "../redact.js";
 import { classifyTool } from "../classifier.js";
 
 const BUDGET_TOLERANCE = 0.95; // Block at 95% of limit
+
+// Track correlation IDs per tool call — keyed by sessionKey + toolName + timestamp bucket
+// This allows us to correlate tool_call, tool_result, and cost events
+const correlationIdMap = new Map<string, string>();
+const CORRELATION_WINDOW_MS = 60_000; // 60 second window to match events
+
+/**
+ * Generate a unique correlation ID.
+ */
+function generateCorrelationId(): string {
+  return `corr_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`;
+}
+
+/**
+ * Build a lookup key for the correlation map.
+ */
+function buildCorrelationKey(sessionKey: string | undefined, toolName: string): string {
+  return `${sessionKey ?? "default"}:${toolName}`;
+}
+
+/**
+ * Clean up old correlation entries to prevent memory leaks.
+ */
+function pruneCorrelationIds(): void {
+  const cutoff = Date.now() - CORRELATION_WINDOW_MS;
+  // The correlationIdMap doesn't store timestamps directly, so we rely on session_end
+  // to clear entries. For now, just cap the map size.
+  if (correlationIdMap.size > 10_000) {
+    // Clear oldest 20% of entries
+    const entriesToDelete = Math.floor(correlationIdMap.size * 0.2);
+    let deleted = 0;
+    for (const key of correlationIdMap.keys()) {
+      correlationIdMap.delete(key);
+      deleted++;
+      if (deleted >= entriesToDelete) break;
+    }
+  }
+}
 
 /**
  * Register security hook handlers.
@@ -116,6 +154,12 @@ export function registerSecurityHandlers(api: any, config: PodwatchConfig): void
       }
 
       // --- B3) Log ALL tool calls for timeline (server classifies risk) ---
+      // Generate correlation ID to link tool_call → tool_result → cost
+      const correlationId = generateCorrelationId();
+      const corrKey = buildCorrelationKey(ctx.sessionKey, toolName);
+      correlationIdMap.set(corrKey, correlationId);
+      pruneCorrelationIds();
+
       const { result: redactedParams, redactedCount } = redactParams(params);
       transmitter.enqueue({
         type: "tool_call",
@@ -123,6 +167,7 @@ export function registerSecurityHandlers(api: any, config: PodwatchConfig): void
         toolName,
         params: redactedParams,
         redactedCount,
+        correlationId,
         sessionKey: ctx.sessionKey,
         agentId: ctx.agentId,
       });
@@ -136,6 +181,10 @@ export function registerSecurityHandlers(api: any, config: PodwatchConfig): void
   api.on(
     "after_tool_call",
     async (event: AfterToolCallEvent, ctx: PluginHookAgentContext): Promise<void> => {
+      // Look up correlation ID from the map (set by before_tool_call)
+      const corrKey = buildCorrelationKey(ctx.sessionKey, event.toolName);
+      const correlationId = correlationIdMap.get(corrKey);
+
       transmitter.enqueue({
         type: "tool_result",
         ts: Date.now(),
@@ -143,6 +192,7 @@ export function registerSecurityHandlers(api: any, config: PodwatchConfig): void
         durationMs: event.durationMs,
         success: !event.error,
         error: event.error ? String(event.error).slice(0, 500) : undefined,
+        correlationId,
         sessionKey: ctx.sessionKey,
         agentId: ctx.agentId,
       });
@@ -154,4 +204,17 @@ export function registerSecurityHandlers(api: any, config: PodwatchConfig): void
     `[podwatch/security] Handlers registered. Budget: ${config.enableBudgetEnforcement ? "ENFORCE" : "off"}, ` +
       `Security: ${config.enableSecurityAlerts ? "ON" : "off"}`
   );
+
+  // Cleanup correlation IDs on session end to prevent memory leaks
+  api.on("session_end", async (_event: unknown, ctx: PluginHookAgentContext) => {
+    const sessionKey = ctx.sessionKey;
+    if (!sessionKey) return;
+
+    // Remove all correlation IDs for this session
+    for (const key of correlationIdMap.keys()) {
+      if (key.startsWith(`${sessionKey}:`)) {
+        correlationIdMap.delete(key);
+      }
+    }
+  }, { name: "podwatch-security-cleanup" });
 }

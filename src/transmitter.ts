@@ -315,6 +315,7 @@ function transformEvents(events: PodwatchEvent[]): Record<string, unknown>[] {
     if (typeof event.durationMs === "number") transformed.durationMs = event.durationMs;
     if (event.params != null) transformed.toolArgs = event.params;
     if (typeof event.redactedCount === "number") transformed.redactedCount = event.redactedCount;
+    if (typeof event.correlationId === "string") transformed.correlationId = event.correlationId;
 
     return transformed;
   });

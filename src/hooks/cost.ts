@@ -9,6 +9,8 @@
  * Dedup strategy: lastSeenIndex tracks how far we've read into event.messages.
  * Each invocation only processes messages from lastSeenIndex onwards, then
  * advances the pointer. Zero memory growth, O(1) bookkeeping.
+ * 
+ * Cost events are correlated per LLM turn (not per tool call) using turn_id.
  */
 
 import type { PodwatchConfig } from "../index.js";
@@ -16,6 +18,14 @@ import { transmitter } from "../transmitter.js";
 
 // Track how far into event.messages we've already processed — per session
 const lastSeenIndexMap = new Map<string, number>();
+
+/**
+ * Generate a turn-based correlation ID for cost events.
+ * Cost events correlate to LLM turns, not individual tool calls.
+ */
+function generateTurnId(): string {
+  return `turn_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`;
+}
 
 /**
  * Reset all dedup state (exported for testing).
@@ -73,6 +83,10 @@ export function registerCostHandler(
       }
     }
 
+    // Generate a turn_id for this batch of cost events (per before_agent_start invocation)
+    // This links all cost events from the same LLM turn together
+    const turnId = generateTurnId();
+
     for (const msg of newMessages) {
       // Only assistant messages have usage data
       if (msg.role !== "assistant") continue;
@@ -99,6 +113,7 @@ export function registerCostHandler(
         costUsd: costTotal,
         costBreakdown: msg.usage.cost, // full {input, output, cacheRead, cacheWrite, total} object
         durationMs: undefined,
+        correlationId: turnId, // Link cost events per turn
         // Tag heartbeat-triggered cost events so the dashboard can distinguish them
         ...(isHeartbeat ? { sessionType: "heartbeat" } : {}),
       });
