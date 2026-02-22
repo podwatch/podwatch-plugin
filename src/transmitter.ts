@@ -61,6 +61,12 @@ interface CachedBudget {
   limit: number;
   currentSpend: number;
   lastSyncTs: number;
+  hardStopEnabled: boolean;
+  hardStopActive: boolean;
+  dailySpend: number;
+  dailyLimit: number;
+  monthlySpend: number;
+  monthlyLimit: number;
 }
 
 let cachedBudget: CachedBudget | null = null;
@@ -342,6 +348,27 @@ async function sendBatch(events: PodwatchEvent[]): Promise<boolean> {
 
     if (response.ok) {
       retryBackoffMs = 1_000;
+
+      // Parse hardStop/budgetExceeded from ingestion response to update budget immediately
+      try {
+        const body = (await response.json()) as {
+          hardStop?: boolean;
+          budgetExceeded?: boolean;
+        };
+        if (cachedBudget && (body.hardStop != null || body.budgetExceeded != null)) {
+          if (typeof body.hardStop === "boolean") {
+            cachedBudget.hardStopActive = body.hardStop;
+          }
+          if (typeof body.budgetExceeded === "boolean" && body.budgetExceeded) {
+            // If the server says budget is exceeded, update the cached state
+            cachedBudget.currentSpend = cachedBudget.limit;
+            cachedBudget.dailySpend = cachedBudget.dailyLimit;
+          }
+        }
+      } catch {
+        // Response may not be JSON — that's fine
+      }
+
       return true;
     }
 
@@ -431,7 +458,7 @@ async function syncBudget(): Promise<void> {
   if (!config) return;
 
   try {
-    const response = await fetch(`${config.endpoint}/budget`, {
+    const response = await fetch(`${config.endpoint}/budget-status`, {
       method: "GET",
       headers: {
         "Content-Type": "application/json",
@@ -441,10 +468,24 @@ async function syncBudget(): Promise<void> {
     });
 
     if (response.ok) {
-      const data = (await response.json()) as { limit?: number; currentSpend?: number };
+      const data = (await response.json()) as {
+        exceeded?: boolean;
+        dailySpend?: number;
+        dailyLimit?: number;
+        monthlySpend?: number;
+        monthlyLimit?: number;
+        hardStopEnabled?: boolean;
+        hardStopActive?: boolean;
+      };
       cachedBudget = {
-        limit: typeof data.limit === "number" ? data.limit : 0,
-        currentSpend: typeof data.currentSpend === "number" ? data.currentSpend : 0,
+        limit: typeof data.dailyLimit === "number" ? data.dailyLimit : 0,
+        currentSpend: typeof data.dailySpend === "number" ? data.dailySpend : 0,
+        dailySpend: typeof data.dailySpend === "number" ? data.dailySpend : 0,
+        dailyLimit: typeof data.dailyLimit === "number" ? data.dailyLimit : 0,
+        monthlySpend: typeof data.monthlySpend === "number" ? data.monthlySpend : 0,
+        monthlyLimit: typeof data.monthlyLimit === "number" ? data.monthlyLimit : 0,
+        hardStopEnabled: data.hardStopEnabled === true,
+        hardStopActive: data.hardStopActive === true,
         lastSyncTs: Date.now(),
       };
       budgetSyncFailures = 0;
@@ -455,7 +496,7 @@ async function syncBudget(): Promise<void> {
     if (response.status === 404) {
       budgetSyncFailures++;
       if (budgetSyncFailures === BUDGET_SYNC_MAX_SILENT_FAILURES) {
-        console.warn("[podwatch] Budget endpoint not available (404). Budget sync disabled until endpoint is deployed.");
+        console.warn("[podwatch] Budget status endpoint not available (404). Budget sync disabled until endpoint is deployed.");
       }
       return;
     }
@@ -656,6 +697,18 @@ export const transmitter = {
   /** Force a budget sync now. */
   async forceBudgetSync(): Promise<void> {
     await syncBudget();
+  },
+
+  /** Update cached budget from event ingestion response (immediate, no network). */
+  updateBudgetFromResponse(response: { hardStop?: boolean; budgetExceeded?: boolean }): void {
+    if (!cachedBudget) return;
+    if (typeof response.hardStop === "boolean") {
+      cachedBudget.hardStopActive = response.hardStop;
+    }
+    if (typeof response.budgetExceeded === "boolean" && response.budgetExceeded) {
+      cachedBudget.currentSpend = cachedBudget.limit;
+      cachedBudget.dailySpend = cachedBudget.dailyLimit;
+    }
   },
 
   // -----------------------------------------------------------------------

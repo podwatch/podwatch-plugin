@@ -70,7 +70,7 @@ export function registerSecurityHandlers(api: any, config: PodwatchConfig): void
   // -----------------------------------------------------------------------
   // before_tool_call — security scan + budget enforcement + exfiltration
   // -----------------------------------------------------------------------
-  api.on(
+  api.registerHook(
     "before_tool_call",
     async (
       event: BeforeToolCallEvent,
@@ -78,10 +78,29 @@ export function registerSecurityHandlers(api: any, config: PodwatchConfig): void
     ): Promise<BeforeToolCallResult | void> => {
       const { toolName, params } = event;
 
-      // --- A) Budget check (if enabled) — can BLOCK ---
+      // --- A0) Hard stop check — blocks ALL tools when hard stop active ---
       if (config.enableBudgetEnforcement) {
         const budget = transmitter.getCachedBudget();
 
+        if (budget?.hardStopActive) {
+          transmitter.enqueue({
+            type: "budget_blocked",
+            ts: Date.now(),
+            toolName,
+            sessionKey: ctx.sessionKey,
+            agentId: ctx.agentId,
+            budgetLimit: budget.limit,
+            currentSpend: budget.currentSpend,
+            hardStop: true,
+          });
+
+          return {
+            block: true,
+            blockReason: "Podwatch: Budget hard stop active. Resume at podwatch.app/costs",
+          };
+        }
+
+        // --- A) Budget check (if enabled) — can BLOCK ---
         if (budget && budget.limit > 0 && budget.currentSpend >= budget.limit * BUDGET_TOLERANCE) {
           transmitter.enqueue({
             type: "budget_blocked",
@@ -172,13 +191,13 @@ export function registerSecurityHandlers(api: any, config: PodwatchConfig): void
         agentId: ctx.agentId,
       });
     },
-    { name: "podwatch-security-scan", priority: 10 } // Run early to block before other plugins
+    { name: "podwatch-security-scan", priority: 10 }, // Run early to block before other plugins
   );
 
   // -----------------------------------------------------------------------
   // after_tool_call — latency + success/failure (fire-and-forget)
   // -----------------------------------------------------------------------
-  api.on(
+  api.registerHook(
     "after_tool_call",
     async (event: AfterToolCallEvent, ctx: PluginHookAgentContext): Promise<void> => {
       // Look up correlation ID from the map (set by before_tool_call)
@@ -197,7 +216,7 @@ export function registerSecurityHandlers(api: any, config: PodwatchConfig): void
         agentId: ctx.agentId,
       });
     },
-    { name: "podwatch-tool-result" }
+    { name: "podwatch-tool-result" },
   );
 
   api.logger.info(
@@ -206,7 +225,7 @@ export function registerSecurityHandlers(api: any, config: PodwatchConfig): void
   );
 
   // Cleanup correlation IDs on session end to prevent memory leaks
-  api.on("session_end", async (_event: unknown, ctx: PluginHookAgentContext) => {
+  api.registerHook("session_end", async (_event: unknown, ctx: PluginHookAgentContext) => {
     const sessionKey = ctx.sessionKey;
     if (!sessionKey) return;
 

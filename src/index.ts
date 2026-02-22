@@ -16,6 +16,7 @@ import { registerCostHandler } from "./hooks/cost.js";
 import { registerSecurityHandlers } from "./hooks/security.js";
 import { registerSessionHandlers } from "./hooks/sessions.js";
 import { registerLifecycleHandlers } from "./hooks/lifecycle.js";
+import { registerBudgetHooks } from "./hooks/budget.js";
 import { transmitter } from "./transmitter.js";
 import { scheduleUpdateCheck } from "./updater.js";
 
@@ -116,6 +117,7 @@ export default function register(api: PluginApi): void {
   registerSecurityHandlers(api, config);
   registerSessionHandlers(api);
   registerLifecycleHandlers(api, config);
+  registerBudgetHooks(api, config);
 
   // Schedule non-blocking auto-update check (30s after boot, 24h cooldown)
   // Auto-update is opt-in (default false) for supply chain security.
