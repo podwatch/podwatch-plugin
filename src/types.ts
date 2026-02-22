@@ -14,6 +14,8 @@ export type PluginHookName =
   | "agent_end"
   | "before_compaction"
   | "after_compaction"
+  | "before_model_resolve"
+  | "before_prompt_build"
   | "message_received"
   | "message_sending"
   | "message_sent"

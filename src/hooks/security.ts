@@ -78,10 +78,29 @@ export function registerSecurityHandlers(api: any, config: PodwatchConfig): void
     ): Promise<BeforeToolCallResult | void> => {
       const { toolName, params } = event;
 
-      // --- A) Budget check (if enabled) — can BLOCK ---
+      // --- A0) Hard stop check — blocks ALL tools when hard stop active ---
       if (config.enableBudgetEnforcement) {
         const budget = transmitter.getCachedBudget();
 
+        if (budget?.hardStopActive) {
+          transmitter.enqueue({
+            type: "budget_blocked",
+            ts: Date.now(),
+            toolName,
+            sessionKey: ctx.sessionKey,
+            agentId: ctx.agentId,
+            budgetLimit: budget.limit,
+            currentSpend: budget.currentSpend,
+            hardStop: true,
+          });
+
+          return {
+            block: true,
+            blockReason: "Podwatch: Budget hard stop active. Resume at podwatch.app/costs",
+          };
+        }
+
+        // --- A) Budget check (if enabled) — can BLOCK ---
         if (budget && budget.limit > 0 && budget.currentSpend >= budget.limit * BUDGET_TOLERANCE) {
           transmitter.enqueue({
             type: "budget_blocked",
