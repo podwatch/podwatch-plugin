@@ -23,8 +23,16 @@ vi.mock("./scanner.js", () => ({
   scanSkillsAndPlugins: vi.fn().mockResolvedValue({ skills: [], plugins: [] }),
 }));
 
+// Mock config-monitor to avoid coupling lifecycle tests to config diffing logic
+vi.mock("./config-monitor.js", () => ({
+  initSnapshot: vi.fn(),
+  checkConfigChanges: vi.fn().mockReturnValue([]),
+  resetSnapshot: vi.fn(),
+}));
+
 import { registerLifecycleHandlers } from "./hooks/lifecycle.js";
 import { transmitter } from "./transmitter.js";
+import { initSnapshot, checkConfigChanges, resetSnapshot } from "./config-monitor.js";
 
 function getEnqueued(): any[] {
   return (transmitter as any)._enqueuedEvents;
@@ -272,5 +280,58 @@ describe("lifecycle — pulse backoff on failure", () => {
     // failure 7 should be at 60min (not 80min) — cap is 60min
     await vi.advanceTimersByTimeAsync(3_600_000); // +60min
     expect(fetchMock.mock.calls.length).toBe(callsAtCap + 1);
+  });
+});
+
+describe("lifecycle — config monitor integration", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    resetEnqueued();
+    vi.mocked(initSnapshot).mockClear();
+    vi.mocked(checkConfigChanges).mockClear();
+    vi.mocked(resetSnapshot).mockClear();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("initializes config snapshot on register", () => {
+    const api = makeApi();
+    globalThis.fetch = vi.fn().mockResolvedValue({ ok: true });
+
+    registerLifecycleHandlers(api, { apiKey: "test" });
+
+    expect(resetSnapshot).toHaveBeenCalled();
+    expect(initSnapshot).toHaveBeenCalledWith(api.config);
+  });
+
+  it("checks config changes on each pulse", async () => {
+    const api = makeApi();
+    globalThis.fetch = vi.fn().mockResolvedValue({ ok: true });
+
+    registerLifecycleHandlers(api, { apiKey: "test", pulseIntervalMs: 300_000 });
+
+    // Initial pulse call checks config
+    expect(checkConfigChanges).toHaveBeenCalledWith(api.config);
+
+    vi.mocked(checkConfigChanges).mockClear();
+
+    // Advance to next pulse
+    await vi.advanceTimersByTimeAsync(300_000);
+    expect(checkConfigChanges).toHaveBeenCalledWith(api.config);
+  });
+
+  it("checks config changes on gateway_start", async () => {
+    const api = makeApi();
+    globalThis.fetch = vi.fn().mockResolvedValue({ ok: true });
+
+    registerLifecycleHandlers(api, { apiKey: "test" });
+    vi.mocked(checkConfigChanges).mockClear();
+
+    // Trigger gateway_start
+    await api._trigger("gateway_start", { port: 3000 });
+
+    expect(checkConfigChanges).toHaveBeenCalledWith(api.config);
   });
 });

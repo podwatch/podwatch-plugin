@@ -17,6 +17,7 @@ import type {
 } from "../types.js";
 import { transmitter } from "../transmitter.js";
 import { scanSkillsAndPlugins } from "../scanner.js";
+import { initSnapshot, checkConfigChanges, resetSnapshot } from "../config-monitor.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
@@ -34,52 +35,7 @@ let pulseFailureCount = 0;
 const PULSE_FAILURE_THRESHOLD = 3; // Start backoff after N consecutive failures
 const PULSE_MAX_INTERVAL_MS = 3_600_000; // 60 min cap
 
-// Config change detection state
-let knownPrimaryModel: string | null = null;
-
-/**
- * Read the primary model from the OpenClaw gateway config.
- * Handles both string and object shapes for `agents.defaults.model`.
- */
-function readPrimaryModel(api: any): string | null {
-  try {
-    const modelCfg = api.config?.agents?.defaults?.model;
-    if (!modelCfg) return null;
-    if (typeof modelCfg === "string") return modelCfg;
-    if (typeof modelCfg === "object" && modelCfg.primary) return String(modelCfg.primary);
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Check if the primary model changed and emit a config_change event if so.
- */
-function checkModelConfigChange(api: any): void {
-  const currentModel = readPrimaryModel(api);
-  if (currentModel === knownPrimaryModel) return;
-
-  const previousValue = knownPrimaryModel;
-  knownPrimaryModel = currentModel;
-
-  // Don't emit on first read if null
-  if (currentModel === null && previousValue === null) return;
-
-  transmitter.enqueue({
-    type: "config_change",
-    ts: Date.now(),
-    field: "model.primary",
-    value: currentModel,
-    previousValue,
-    // Pass as params so they appear in toolArgs on the server
-    params: {
-      field: "model.primary",
-      value: currentModel,
-      previousValue,
-    },
-  });
-}
+// Config change detection is now handled by config-monitor.ts
 
 /**
  * Register lifecycle hook handlers.
@@ -98,9 +54,9 @@ export function registerLifecycleHandlers(api: any, config: PodwatchConfig): voi
   // Reset pulse backoff state
   pulseFailureCount = 0;
 
-  // Read initial primary model config and send config_change event
-  knownPrimaryModel = null; // Reset on re-register
-  checkModelConfigChange(api);
+  // Initialize config monitor snapshot (baseline — no events emitted)
+  resetSnapshot();
+  initSnapshot(api.config ?? {});
 
   // Send initial pulse right now
   void sendPulseWithBackoff(endpoint, apiKey, basePulseIntervalMs, api);
@@ -129,6 +85,10 @@ export function registerLifecycleHandlers(api: any, config: PodwatchConfig): voi
   api.on(
     "gateway_start",
     async (event: GatewayStartEvent): Promise<void> => {
+      // Check config changes on gateway restart (config may have changed)
+      if (api.config) {
+        checkConfigChanges(api.config);
+      }
       // Re-run scan as best-effort; pulse is already running
       void runScan(api.config?.agents?.defaults?.workspace);
     },
@@ -225,8 +185,8 @@ async function sendPulseWithBackoff(
   api?: any,
 ): Promise<void> {
   // Check for config changes on each pulse
-  if (api) {
-    checkModelConfigChange(api);
+  if (api?.config) {
+    checkConfigChanges(api.config);
   }
   let success = false;
   try {
