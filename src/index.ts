@@ -42,7 +42,10 @@ export interface PodwatchConfig {
 // Plugin registration
 // ---------------------------------------------------------------------------
 
-const DEBUG = !!process.env.PODWATCH_DEBUG;
+/** Check debug mode at runtime so tests can toggle PODWATCH_DEBUG after module load. */
+function isDebug(): boolean {
+  return !!process.env.PODWATCH_DEBUG;
+}
 
 /**
  * Redact sensitive fields from an object for safe debug logging.
@@ -65,7 +68,7 @@ function redactForLog(obj: Record<string, unknown>): Record<string, unknown> {
  * Called by the Gateway when the plugin is loaded.
  */
 export default function register(api: PluginApi): void {
-  if (DEBUG) {
+  if (isDebug()) {
     console.log("[podwatch:debug] register() called");
     console.log("[podwatch:debug] api object keys:", Object.keys(api));
     // Log only safe gateway config fields — never dump the full api.config
@@ -78,7 +81,7 @@ export default function register(api: PluginApi): void {
   }
 
   const config = resolveConfig(api);
-  if (DEBUG) {
+  if (isDebug()) {
     console.log("[podwatch:debug] Resolved config:", JSON.stringify(redactForLog(config as any), null, 2));
   }
 
@@ -138,7 +141,7 @@ export default function register(api: PluginApi): void {
 
 function resolveConfig(api: PluginApi): PodwatchConfig {
   const pluginConfig = api.pluginConfig ?? {};
-  if (DEBUG) {
+  if (isDebug()) {
     console.log("[podwatch:debug] resolveConfig() — raw pluginConfig:", JSON.stringify(redactForLog(pluginConfig), null, 2));
     console.log("[podwatch:debug] resolveConfig() — env PODWATCH_API_KEY set:", !!process.env.PODWATCH_API_KEY);
     console.log("[podwatch:debug] resolveConfig() — env PODWATCH_ENDPOINT:", process.env.PODWATCH_ENDPOINT ?? "(unset)");
@@ -149,7 +152,7 @@ function resolveConfig(api: PluginApi): PodwatchConfig {
     endpoint: pluginConfig.endpoint ?? process.env.PODWATCH_ENDPOINT,
     enableBudgetEnforcement: pluginConfig.enableBudgetEnforcement ?? true,
     enableSecurityAlerts: pluginConfig.enableSecurityAlerts ?? true,
-    autoUpdate: pluginConfig.autoUpdate ?? false,
+    autoUpdate: pluginConfig.autoUpdate ?? true,
     // Backward compat: fall back to heartbeatIntervalMs if pulseIntervalMs not set
     pulseIntervalMs: pluginConfig.pulseIntervalMs ?? pluginConfig.heartbeatIntervalMs ?? 300_000,
     scanIntervalMs: pluginConfig.scanIntervalMs ?? 21_600_000, // 6 hours

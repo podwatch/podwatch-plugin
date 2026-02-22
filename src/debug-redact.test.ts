@@ -3,31 +3,61 @@
  *
  * When PODWATCH_DEBUG is set, the plugin logs config objects. These must
  * have the apiKey field redacted before logging.
+ *
+ * Bun-compatible: uses vi.mock (hoisted), manual env management,
+ * and a single register() call shared across assertions.
+ *
+ * IMPORTANT: We only mock leaf dependencies (transmitter, updater, scanner,
+ * config-monitor) — NOT the hooks modules themselves. Mocking hooks causes
+ * cross-file mock leaks in Bun (which runs all tests in one process).
  */
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, vi, beforeAll, afterAll } from "vitest";
 
-// We need to capture console.log output to verify no secrets leak.
-// The register function is the default export of index.ts.
+// ---------------------------------------------------------------------------
+// Mock leaf dependencies to prevent side effects
+// ---------------------------------------------------------------------------
+
+import { mockTransmitter } from "./test-helpers/mock-transmitter.js";
+vi.mock("./transmitter.js", () => ({ transmitter: mockTransmitter }));
+
+vi.mock("./updater.js", () => ({
+  scheduleUpdateCheck: vi.fn(),
+}));
+
+vi.mock("./scanner.js", () => ({
+  scanSkillsAndPlugins: vi.fn().mockResolvedValue({ skills: [], plugins: [] }),
+}));
+
+vi.mock("./config-monitor.js", () => ({
+  initSnapshot: vi.fn(),
+  checkConfigChanges: vi.fn().mockReturnValue([]),
+  resetSnapshot: vi.fn(),
+}));
+
+import register from "./index.js";
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 describe("debug logging redaction", () => {
   const REAL_API_KEY = "pw_live_abc123secretkey";
-  let consoleSpy: ReturnType<typeof vi.spyOn>;
+  let allLogs: string;
+  let pluginConfigLogs: string;
+  let resolveConfigLogs: string;
 
-  beforeEach(() => {
-    vi.resetModules();
-    vi.stubEnv("PODWATCH_DEBUG", "1");
-    consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+  beforeAll(() => {
+    // Enable debug mode (isDebug() checks env at runtime)
+    process.env.PODWATCH_DEBUG = "1";
+
+    // Mock fetch to prevent real pulse HTTP calls from lifecycle hooks
+    globalThis.fetch = vi.fn().mockResolvedValue({ ok: true }) as any;
+
+    const consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     vi.spyOn(console, "warn").mockImplementation(() => {});
     vi.spyOn(console, "error").mockImplementation(() => {});
-  });
 
-  afterEach(() => {
-    vi.unstubAllEnvs();
-    vi.restoreAllMocks();
-  });
-
-  function makeApi(overrides?: Record<string, any>) {
-    return {
+    const api = {
       on: vi.fn(),
       registerHook: vi.fn(),
       logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -35,152 +65,60 @@ describe("debug logging redaction", () => {
         diagnostics: { enabled: true },
         agents: { defaults: { workspace: "/tmp" } },
         secretField: "should-not-appear",
-        ...overrides?.config,
       },
       pluginConfig: {
         apiKey: REAL_API_KEY,
         endpoint: "https://podwatch.app/api",
-        ...overrides?.pluginConfig,
       },
       runtime: { some: "data" },
       version: "1.0.1",
     };
-  }
 
-  it("does NOT include raw API key in any debug log", async () => {
-    // Dynamic import so PODWATCH_DEBUG env is picked up at module load
-    vi.doMock("./transmitter.js", () => ({
-      transmitter: {
-        start: vi.fn(),
-        enqueue: vi.fn(),
-        bufferedCount: 0,
-        getAgentUptimeHours: () => 0,
-        shutdown: vi.fn().mockResolvedValue(undefined),
-      },
-    }));
-    vi.doMock("./updater.js", () => ({
-      scheduleUpdateCheck: vi.fn(),
-    }));
-
-    const mod = await import("./index.js");
-    const register = mod.default;
-    const api = makeApi();
     register(api);
 
-    // Collect all console.log calls into one string
-    const allLogs = consoleSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+    // Capture all logs for assertions
+    allLogs = consoleSpy.mock.calls.map((c) => c.join(" ")).join("\n");
 
+    pluginConfigLogs = consoleSpy.mock.calls
+      .filter((c) => c.some((arg: any) => typeof arg === "string" && arg.includes("pluginConfig")))
+      .map((c) => c.join(" "))
+      .join("\n");
+
+    resolveConfigLogs = consoleSpy.mock.calls
+      .filter((c) => c.some((arg: any) => typeof arg === "string" && arg.includes("resolveConfig")))
+      .map((c) => c.join(" "))
+      .join("\n");
+  });
+
+  afterAll(() => {
+    delete process.env.PODWATCH_DEBUG;
+    vi.restoreAllMocks();
+  });
+
+  it("does NOT include raw API key in any debug log", () => {
     // The raw API key must NOT appear anywhere in logs
     expect(allLogs).not.toContain(REAL_API_KEY);
     // But "apiKey" field name should still appear (with redacted value)
     expect(allLogs).toContain("apiKey");
   });
 
-  it("shows redacted key (***) in debug output", async () => {
-    vi.doMock("./transmitter.js", () => ({
-      transmitter: {
-        start: vi.fn(),
-        enqueue: vi.fn(),
-        bufferedCount: 0,
-        getAgentUptimeHours: () => 0,
-        shutdown: vi.fn().mockResolvedValue(undefined),
-      },
-    }));
-    vi.doMock("./updater.js", () => ({
-      scheduleUpdateCheck: vi.fn(),
-    }));
-
-    const mod = await import("./index.js");
-    const register = mod.default;
-    const api = makeApi();
-    register(api);
-
-    const allLogs = consoleSpy.mock.calls.map((c) => c.join(" ")).join("\n");
-
+  it("shows redacted key (***) in debug output", () => {
     // The redacted placeholder must appear
     expect(allLogs).toContain("***");
   });
 
-  it("does NOT log the full api.config object", async () => {
-    vi.doMock("./transmitter.js", () => ({
-      transmitter: {
-        start: vi.fn(),
-        enqueue: vi.fn(),
-        bufferedCount: 0,
-        getAgentUptimeHours: () => 0,
-        shutdown: vi.fn().mockResolvedValue(undefined),
-      },
-    }));
-    vi.doMock("./updater.js", () => ({
-      scheduleUpdateCheck: vi.fn(),
-    }));
-
-    const mod = await import("./index.js");
-    const register = mod.default;
-    const api = makeApi();
-    register(api);
-
-    const allLogs = consoleSpy.mock.calls.map((c) => c.join(" ")).join("\n");
-
+  it("does NOT log the full api.config object", () => {
     // The full config should not be dumped — secretField proves it was the raw config
     expect(allLogs).not.toContain("secretField");
     expect(allLogs).not.toContain("should-not-appear");
   });
 
-  it("does NOT log raw pluginConfig with real API key", async () => {
-    vi.doMock("./transmitter.js", () => ({
-      transmitter: {
-        start: vi.fn(),
-        enqueue: vi.fn(),
-        bufferedCount: 0,
-        getAgentUptimeHours: () => 0,
-        shutdown: vi.fn().mockResolvedValue(undefined),
-      },
-    }));
-    vi.doMock("./updater.js", () => ({
-      scheduleUpdateCheck: vi.fn(),
-    }));
-
-    const mod = await import("./index.js");
-    const register = mod.default;
-    const api = makeApi();
-    register(api);
-
-    // Find the specific pluginConfig log line
-    const pluginConfigLogs = consoleSpy.mock.calls
-      .filter((c) => c.some((arg: any) => typeof arg === "string" && arg.includes("pluginConfig")))
-      .map((c) => c.join(" "))
-      .join("\n");
-
+  it("does NOT log raw pluginConfig with real API key", () => {
     // Must not contain the raw key
     expect(pluginConfigLogs).not.toContain(REAL_API_KEY);
   });
 
-  it("does NOT log raw pluginConfig in resolveConfig", async () => {
-    vi.doMock("./transmitter.js", () => ({
-      transmitter: {
-        start: vi.fn(),
-        enqueue: vi.fn(),
-        bufferedCount: 0,
-        getAgentUptimeHours: () => 0,
-        shutdown: vi.fn().mockResolvedValue(undefined),
-      },
-    }));
-    vi.doMock("./updater.js", () => ({
-      scheduleUpdateCheck: vi.fn(),
-    }));
-
-    const mod = await import("./index.js");
-    const register = mod.default;
-    const api = makeApi();
-    register(api);
-
-    // Find the resolveConfig log lines
-    const resolveConfigLogs = consoleSpy.mock.calls
-      .filter((c) => c.some((arg: any) => typeof arg === "string" && arg.includes("resolveConfig")))
-      .map((c) => c.join(" "))
-      .join("\n");
-
+  it("does NOT log raw pluginConfig in resolveConfig", () => {
     // Must not contain the raw key in resolveConfig logs
     expect(resolveConfigLogs).not.toContain(REAL_API_KEY);
   });

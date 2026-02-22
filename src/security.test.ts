@@ -1,38 +1,18 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
-// Must use vi.hoisted so the mock fns are available before vi.mock hoisting
-const {
-  mockEnqueue,
-  mockGetCachedBudget,
-  mockMarkCredentialAccess,
-  mockHasRecentCredentialAccess,
-  mockGetRecentCredentialAccess,
-  mockIsKnownTool,
-  mockRecordToolSeen,
-  mockGetAgentUptimeHours,
-} = vi.hoisted(() => ({
-  mockEnqueue: vi.fn(),
-  mockGetCachedBudget: vi.fn().mockReturnValue(null),
-  mockMarkCredentialAccess: vi.fn(),
-  mockHasRecentCredentialAccess: vi.fn().mockReturnValue(false),
-  mockGetRecentCredentialAccess: vi.fn().mockReturnValue(null),
-  mockIsKnownTool: vi.fn().mockReturnValue(false),
-  mockRecordToolSeen: vi.fn(),
-  mockGetAgentUptimeHours: vi.fn().mockReturnValue(0),
-}));
+// Use shared transmitter mock (Bun runs all files in one process — mocks leak)
+import { mockTransmitter, resetMockTransmitter } from "./test-helpers/mock-transmitter.js";
+vi.mock("./transmitter.js", () => ({ transmitter: mockTransmitter }));
 
-vi.mock("./transmitter.js", () => ({
-  transmitter: {
-    enqueue: mockEnqueue,
-    getCachedBudget: mockGetCachedBudget,
-    markCredentialAccess: mockMarkCredentialAccess,
-    hasRecentCredentialAccess: mockHasRecentCredentialAccess,
-    getRecentCredentialAccess: mockGetRecentCredentialAccess,
-    isKnownTool: mockIsKnownTool,
-    recordToolSeen: mockRecordToolSeen,
-    getAgentUptimeHours: mockGetAgentUptimeHours,
-  },
-}));
+// Alias mock functions for readability in tests
+const mockEnqueue = mockTransmitter.enqueue;
+const mockGetCachedBudget = mockTransmitter.getCachedBudget;
+const mockMarkCredentialAccess = mockTransmitter.markCredentialAccess;
+const mockHasRecentCredentialAccess = mockTransmitter.hasRecentCredentialAccess;
+const mockGetRecentCredentialAccess = mockTransmitter.getRecentCredentialAccess;
+const mockIsKnownTool = mockTransmitter.isKnownTool;
+const mockRecordToolSeen = mockTransmitter.recordToolSeen;
+const mockGetAgentUptimeHours = mockTransmitter.getAgentUptimeHours;
 
 import { registerSecurityHandlers } from "./hooks/security.js";
 
@@ -47,7 +27,7 @@ describe("security hooks", () => {
   const defaultCtx = { sessionKey: "agent:main:interactive", agentId: "main" };
 
   beforeEach(() => {
-    vi.resetAllMocks();
+    resetMockTransmitter();
     mockGetCachedBudget.mockReturnValue(null);
     mockHasRecentCredentialAccess.mockReturnValue(false);
     mockGetRecentCredentialAccess.mockReturnValue(null);

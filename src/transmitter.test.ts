@@ -10,16 +10,16 @@ vi.mock("node:fs", () => ({
   statSync: vi.fn(() => { throw new Error("ENOENT"); }),
   readFileSync: vi.fn((filePath: string) => {
     if (typeof filePath === "string" && filePath.endsWith("package.json")) {
-      return JSON.stringify({ version: "1.0.1" });
+      return JSON.stringify({ version: "1.1.0" });
     }
     return "";
   }),
   writeFileSync: vi.fn(),
   chmodSync: vi.fn(),
 }));
-vi.mock("node:path", async () => {
-  const actual = await vi.importActual<typeof import("node:path")>("node:path");
-  return { ...actual, dirname: actual.dirname, join: actual.join };
+vi.mock("node:path", () => {
+  const actual = require("node:path");
+  return { ...actual, default: actual, dirname: actual.dirname, join: actual.join };
 });
 vi.mock("node:os", () => ({
   homedir: () => "/mock-home",
@@ -411,7 +411,7 @@ describe("transmitter — M1: plugin version from package.json", () => {
     // Reset readFileSync to return package.json for version reads
     (fs.readFileSync as any).mockImplementation((filePath: string) => {
       if (typeof filePath === "string" && filePath.endsWith("package.json")) {
-        return JSON.stringify({ version: "1.0.1" });
+        return JSON.stringify({ version: "1.1.0" });
       }
       return "";
     });
@@ -438,7 +438,7 @@ describe("transmitter — M1: plugin version from package.json", () => {
     const call = (globalThis.fetch as any).mock.calls[0];
     const body = JSON.parse(call[1].body);
     // Must match package.json version, not hardcoded "0.1.0"
-    expect(body.skillVersion).toBe("1.0.1");
+    expect(body.skillVersion).toBe("1.1.0");
     expect(body.skillVersion).not.toBe("0.1.0");
   });
 });
@@ -449,7 +449,7 @@ describe("transmitter — M3: audit log rotation and permissions", () => {
     // Reset readFileSync to return package.json for version reads
     (fs.readFileSync as any).mockImplementation((filePath: string) => {
       if (typeof filePath === "string" && filePath.endsWith("package.json")) {
-        return JSON.stringify({ version: "1.0.1" });
+        return JSON.stringify({ version: "1.1.0" });
       }
       return "";
     });
@@ -485,7 +485,7 @@ describe("transmitter — M3: audit log rotation and permissions", () => {
     const bigContent = "A".repeat(500_000) + "\n" + "B".repeat(500_000) + "\n";
     (fs.readFileSync as any).mockImplementation((filePath: string) => {
       if (typeof filePath === "string" && filePath.endsWith("package.json")) {
-        return JSON.stringify({ version: "1.0.1" });
+        return JSON.stringify({ version: "1.1.0" });
       }
       return bigContent;
     });

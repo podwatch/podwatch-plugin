@@ -4,42 +4,20 @@
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
-// Hoist mock variables for transmitter
-const {
-  mockEnqueue,
-  mockGetCachedBudget,
-  mockMarkCredentialAccess,
-  mockHasRecentCredentialAccess,
-  mockGetRecentCredentialAccess,
-  mockIsKnownTool,
-  mockRecordToolSeen,
-  mockGetAgentUptimeHours,
-  mockUpdateBudgetFromResponse,
-} = vi.hoisted(() => ({
-  mockEnqueue: vi.fn(),
-  mockGetCachedBudget: vi.fn().mockReturnValue(null),
-  mockMarkCredentialAccess: vi.fn(),
-  mockHasRecentCredentialAccess: vi.fn().mockReturnValue(false),
-  mockGetRecentCredentialAccess: vi.fn().mockReturnValue(null),
-  mockIsKnownTool: vi.fn().mockReturnValue(false),
-  mockRecordToolSeen: vi.fn(),
-  mockGetAgentUptimeHours: vi.fn().mockReturnValue(0),
-  mockUpdateBudgetFromResponse: vi.fn(),
-}));
+// Use shared transmitter mock (Bun runs all files in one process — mocks leak)
+import { mockTransmitter, resetMockTransmitter } from "./test-helpers/mock-transmitter.js";
+vi.mock("./transmitter.js", () => ({ transmitter: mockTransmitter }));
 
-vi.mock("./transmitter.js", () => ({
-  transmitter: {
-    enqueue: mockEnqueue,
-    getCachedBudget: mockGetCachedBudget,
-    markCredentialAccess: mockMarkCredentialAccess,
-    hasRecentCredentialAccess: mockHasRecentCredentialAccess,
-    getRecentCredentialAccess: mockGetRecentCredentialAccess,
-    isKnownTool: mockIsKnownTool,
-    recordToolSeen: mockRecordToolSeen,
-    getAgentUptimeHours: mockGetAgentUptimeHours,
-    updateBudgetFromResponse: mockUpdateBudgetFromResponse,
-  },
-}));
+// Alias mock functions for readability in tests
+const mockEnqueue = mockTransmitter.enqueue;
+const mockGetCachedBudget = mockTransmitter.getCachedBudget;
+const mockMarkCredentialAccess = mockTransmitter.markCredentialAccess;
+const mockHasRecentCredentialAccess = mockTransmitter.hasRecentCredentialAccess;
+const mockGetRecentCredentialAccess = mockTransmitter.getRecentCredentialAccess;
+const mockIsKnownTool = mockTransmitter.isKnownTool;
+const mockRecordToolSeen = mockTransmitter.recordToolSeen;
+const mockGetAgentUptimeHours = mockTransmitter.getAgentUptimeHours;
+const mockUpdateBudgetFromResponse = mockTransmitter.updateBudgetFromResponse;
 
 import { registerBudgetHooks, findCheapestModel } from "./hooks/budget.js";
 import { registerSecurityHandlers } from "./hooks/security.js";
@@ -158,7 +136,7 @@ describe("findCheapestModel", () => {
 // ---------------------------------------------------------------------------
 describe("before_model_resolve", () => {
   beforeEach(() => {
-    vi.resetAllMocks();
+    resetMockTransmitter();
     mockGetCachedBudget.mockReturnValue(null);
   });
 
@@ -269,7 +247,7 @@ describe("before_model_resolve", () => {
 // ---------------------------------------------------------------------------
 describe("before_prompt_build", () => {
   beforeEach(() => {
-    vi.resetAllMocks();
+    resetMockTransmitter();
     mockGetCachedBudget.mockReturnValue(null);
   });
 
@@ -336,7 +314,7 @@ describe("hard stop tool blocking (security.ts)", () => {
   const defaultCtx = { sessionKey: "agent:main:interactive", agentId: "main" };
 
   beforeEach(() => {
-    vi.resetAllMocks();
+    resetMockTransmitter();
     mockGetCachedBudget.mockReturnValue(null);
     mockHasRecentCredentialAccess.mockReturnValue(false);
     mockGetRecentCredentialAccess.mockReturnValue(null);

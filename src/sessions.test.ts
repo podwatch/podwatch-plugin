@@ -3,18 +3,8 @@
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
-vi.mock("./transmitter.js", () => {
-  const enqueuedEvents: any[] = [];
-  return {
-    transmitter: {
-      enqueue: vi.fn((event: any) => enqueuedEvents.push(event)),
-      _enqueuedEvents: enqueuedEvents,
-      _reset() {
-        enqueuedEvents.length = 0;
-      },
-    },
-  };
-});
+import { mockTransmitter, enqueuedEvents } from "./test-helpers/mock-transmitter.js";
+vi.mock("./transmitter.js", () => ({ transmitter: mockTransmitter }));
 
 import { registerSessionHandlers } from "./hooks/sessions.js";
 import { transmitter } from "./transmitter.js";

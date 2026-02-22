@@ -3,15 +3,10 @@
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
-// Mock transmitter before importing config-monitor
-const { mockEnqueue } = vi.hoisted(() => ({
-  mockEnqueue: vi.fn(),
-}));
-vi.mock("./transmitter.js", () => ({
-  transmitter: {
-    enqueue: mockEnqueue,
-  },
-}));
+// Use shared transmitter mock (Bun runs all files in one process — mocks leak)
+import { mockTransmitter, resetMockTransmitter } from "./test-helpers/mock-transmitter.js";
+vi.mock("./transmitter.js", () => ({ transmitter: mockTransmitter }));
+const mockEnqueue = mockTransmitter.enqueue;
 
 import {
   deepGet,

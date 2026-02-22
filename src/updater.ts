@@ -564,7 +564,7 @@ export function triggerGatewayRestart(
 // ---------------------------------------------------------------------------
 
 export interface UpdateOptions {
-  /** Enable auto-update. Default: false (opt-in). */
+  /** Enable auto-update. Default: true. Set false to disable. */
   autoUpdate?: boolean;
 }
 
@@ -576,7 +576,7 @@ export interface UpdateOptions {
  * Schedule a non-blocking update check 30s after startup.
  * Safe to call synchronously — it sets a timer and returns immediately.
  *
- * Auto-update is opt-in: only runs if options.autoUpdate is explicitly true.
+ * Auto-update is on by default. Set autoUpdate: false in plugin config to disable.
  *
  * @param currentVersion The plugin's current version from package.json
  * @param endpoint The Podwatch API endpoint (for dashboard fallback)
@@ -620,8 +620,8 @@ export async function runUpdateCheck(
 ): Promise<void> {
   try {
     // 1. Check opt-in — auto-update must be explicitly enabled
-    if (options.autoUpdate !== true) {
-      logger.info("[podwatch/updater] Auto-update is disabled. Set autoUpdate: true in plugin config to enable.");
+    if (options.autoUpdate === false) {
+      logger.info("[podwatch/updater] Auto-update is disabled. Remove autoUpdate: false from plugin config to re-enable.");
       return;
     }
 

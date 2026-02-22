@@ -63,9 +63,24 @@ vi.mock("node:os", () => ({
   homedir: () => "/home/testuser",
 }));
 
-// Mock global fetch
+// Mock global fetch (Bun doesn't have vi.stubGlobal)
 const mockFetch = vi.fn();
-vi.stubGlobal("fetch", mockFetch);
+globalThis.fetch = mockFetch as any;
+
+/**
+ * Bun's vi.resetAllMocks() / vi.clearAllMocks() do NOT clear the
+ * mockReturnValueOnce queue. We must call .mockReset() on each mock.
+ */
+function resetMocks() {
+  mockSpawnSync.mockReset();
+  mockReadFileSync.mockReset();
+  mockWriteFileSync.mockReset();
+  mockMkdirSync.mockReset();
+  mockExistsSync.mockReset();
+  mockMkdtempSync.mockReset();
+  mockRmSync.mockReset();
+  mockFetch.mockReset();
+}
 
 // Now import the module under test
 import {
@@ -141,7 +156,7 @@ describe("compareVersions", () => {
 
 describe("shouldCheckForUpdate", () => {
   beforeEach(() => {
-    vi.clearAllMocks();
+    resetMocks();
   });
 
   it("returns true when cache file does not exist", () => {
@@ -180,7 +195,7 @@ describe("shouldCheckForUpdate", () => {
 
 describe("writeCacheTimestamp", () => {
   beforeEach(() => {
-    vi.clearAllMocks();
+    resetMocks();
   });
 
   it("writes JSON with lastCheckTs", () => {
@@ -205,7 +220,7 @@ describe("writeCacheTimestamp", () => {
 
 describe("checkForUpdate", () => {
   beforeEach(() => {
-    vi.clearAllMocks();
+    resetMocks();
   });
 
   it("returns newer version from npm registry", async () => {
@@ -291,7 +306,7 @@ describe("checkForUpdate", () => {
 
 describe("executeUpdate", () => {
   beforeEach(() => {
-    vi.resetAllMocks();
+    resetMocks();
     mockMkdtempSync.mockReturnValue("/tmp/podwatch-update-abc123");
     // Default: dist dir does not exist
     mockExistsSync.mockReturnValue(false);
@@ -442,15 +457,25 @@ describe("executeUpdate", () => {
 });
 
 describe("writeRestartSentinel", () => {
+  let savedEnv: Record<string, string | undefined>;
+
   beforeEach(() => {
-    vi.resetAllMocks();
-    vi.stubEnv("HOME", "/home/testuser");
+    resetMocks();
+    savedEnv = {
+      HOME: process.env.HOME,
+      OPENCLAW_STATE_DIR: process.env.OPENCLAW_STATE_DIR,
+      CLAWDBOT_STATE_DIR: process.env.CLAWDBOT_STATE_DIR,
+    };
+    process.env.HOME = "/home/testuser";
     delete process.env.OPENCLAW_STATE_DIR;
     delete process.env.CLAWDBOT_STATE_DIR;
   });
 
   afterEach(() => {
-    vi.unstubAllEnvs();
+    for (const [key, val] of Object.entries(savedEnv)) {
+      if (val === undefined) delete process.env[key];
+      else process.env[key] = val;
+    }
   });
 
   it("writes sentinel JSON with correct structure", () => {
@@ -490,7 +515,7 @@ describe("writeRestartSentinel", () => {
   });
 
   it("respects OPENCLAW_STATE_DIR env var", () => {
-    vi.stubEnv("OPENCLAW_STATE_DIR", "/custom/state");
+    process.env.OPENCLAW_STATE_DIR = "/custom/state";
     writeRestartSentinel("1.2.0");
 
     expect(mockWriteFileSync).toHaveBeenCalled();
@@ -500,21 +525,32 @@ describe("writeRestartSentinel", () => {
 });
 
 describe("resolveStateDir", () => {
+  let savedEnv: Record<string, string | undefined>;
+
   beforeEach(() => {
+    savedEnv = {
+      OPENCLAW_STATE_DIR: process.env.OPENCLAW_STATE_DIR,
+      CLAWDBOT_STATE_DIR: process.env.CLAWDBOT_STATE_DIR,
+    };
     delete process.env.OPENCLAW_STATE_DIR;
     delete process.env.CLAWDBOT_STATE_DIR;
   });
 
+  afterEach(() => {
+    for (const [key, val] of Object.entries(savedEnv)) {
+      if (val === undefined) delete process.env[key];
+      else process.env[key] = val;
+    }
+  });
+
   it("returns OPENCLAW_STATE_DIR when set", () => {
-    vi.stubEnv("OPENCLAW_STATE_DIR", "/custom/state");
+    process.env.OPENCLAW_STATE_DIR = "/custom/state";
     expect(resolveStateDir()).toBe("/custom/state");
-    vi.unstubAllEnvs();
   });
 
   it("returns CLAWDBOT_STATE_DIR when set", () => {
-    vi.stubEnv("CLAWDBOT_STATE_DIR", "/legacy/state");
+    process.env.CLAWDBOT_STATE_DIR = "/legacy/state";
     expect(resolveStateDir()).toBe("/legacy/state");
-    vi.unstubAllEnvs();
   });
 
   it("defaults to ~/.openclaw", () => {
@@ -581,9 +617,15 @@ describe("service name resolution", () => {
 
 describe("triggerGatewayRestart", () => {
   const originalPlatform = process.platform;
+  let savedEnv: Record<string, string | undefined>;
 
   beforeEach(() => {
-    vi.resetAllMocks();
+    resetMocks();
+    savedEnv = {
+      OPENCLAW_SYSTEMD_UNIT: process.env.OPENCLAW_SYSTEMD_UNIT,
+      OPENCLAW_PROFILE: process.env.OPENCLAW_PROFILE,
+      OPENCLAW_LAUNCHD_LABEL: process.env.OPENCLAW_LAUNCHD_LABEL,
+    };
     delete process.env.OPENCLAW_SYSTEMD_UNIT;
     delete process.env.OPENCLAW_PROFILE;
     delete process.env.OPENCLAW_LAUNCHD_LABEL;
@@ -591,6 +633,10 @@ describe("triggerGatewayRestart", () => {
 
   afterEach(() => {
     Object.defineProperty(process, "platform", { value: originalPlatform });
+    for (const [key, val] of Object.entries(savedEnv)) {
+      if (val === undefined) delete process.env[key];
+      else process.env[key] = val;
+    }
   });
 
   describe("Linux (systemd)", () => {
@@ -832,12 +878,12 @@ describe("triggerGatewayRestart", () => {
 
 describe("runUpdateCheck — autoUpdate opt-in", () => {
   beforeEach(() => {
-    vi.resetAllMocks();
+    resetMocks();
     // Make shouldCheckForUpdate() return true (no cache file)
     mockExistsSync.mockReturnValue(false);
   });
 
-  it("does NOT run when autoUpdate is false (default)", async () => {
+  it("does NOT run when autoUpdate is explicitly false", async () => {
     const logger = mockLogger();
     await runUpdateCheck("1.0.0", "https://podwatch.app/api", logger, { autoUpdate: false });
 
@@ -848,14 +894,15 @@ describe("runUpdateCheck — autoUpdate opt-in", () => {
     );
   });
 
-  it("does NOT run when autoUpdate is undefined (default)", async () => {
+  it("runs when autoUpdate is undefined (default is now true)", async () => {
     const logger = mockLogger();
+    // npm returns same version (no update)
+    mockFetch.mockResolvedValueOnce(jsonResponse({ version: "1.0.0" }));
+
     await runUpdateCheck("1.0.0", "https://podwatch.app/api", logger, {});
 
-    expect(mockFetch).not.toHaveBeenCalled();
-    expect(logger.info).toHaveBeenCalledWith(
-      expect.stringContaining("Auto-update is disabled")
-    );
+    // autoUpdate defaults to true, so it should proceed and call fetch
+    expect(mockFetch).toHaveBeenCalled();
   });
 
   it("runs when autoUpdate is explicitly true", async () => {
@@ -918,7 +965,7 @@ describe("runUpdateCheck — integrity verification", () => {
   const originalPlatform = process.platform;
 
   beforeEach(() => {
-    vi.resetAllMocks();
+    resetMocks();
     // Make shouldCheckForUpdate() return true (no cache file)
     mockExistsSync.mockReturnValue(false);
     Object.defineProperty(process, "platform", { value: "linux" });
