@@ -332,7 +332,7 @@ async function sendBatch(events: PodwatchEvent[]): Promise<boolean> {
 
   const payload = {
     events: transformEvents(events),
-    skillVersion: PLUGIN_VERSION,
+    pluginVersion: PLUGIN_VERSION,
   };
 
   try {
