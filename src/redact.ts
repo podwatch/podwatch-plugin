@@ -267,6 +267,118 @@ function isHighEntropySecret(s: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// Inline-safe patterns (derived from SENSITIVE_VALUE_PATTERNS)
+// ---------------------------------------------------------------------------
+
+/**
+ * Build regex variants suitable for inline (substring) replacement.
+ * - Strip `^` / `$` anchors so patterns can match mid-string.
+ * - PEM header patterns are replaced by a single block-level pattern that
+ *   captures from `-----BEGIN …` through `-----END …-----` (or end-of-string).
+ * - The `g` flag is added so `.matchAll()` can find all occurrences.
+ */
+function buildInlinePatterns(): RegExp[] {
+  const out: RegExp[] = [];
+
+  for (const pattern of SENSITIVE_VALUE_PATTERNS) {
+    // Skip individual PEM header patterns — replaced by unified block pattern below
+    if (pattern.source.includes('BEGIN')) continue;
+
+    let source = pattern.source;
+    if (source.startsWith('^')) source = source.slice(1);
+    if (source.endsWith('$')) source = source.slice(0, -1);
+
+    const flags = pattern.flags.includes('g') ? pattern.flags : pattern.flags + 'g';
+    out.push(new RegExp(source, flags));
+  }
+
+  // Unified PEM block pattern: matches from -----BEGIN ... through -----END ...-----
+  // or through end-of-string when no END marker exists.
+  out.push(
+    /-----BEGIN\s+(?:(?:RSA|OPENSSH|EC|DSA|ENCRYPTED)\s+)?(?:PRIVATE\s+KEY|CERTIFICATE)[\s\S]*?(?:-----END[^\n]*-----|$)/g,
+  );
+
+  return out;
+}
+
+const INLINE_PATTERNS: RegExp[] = buildInlinePatterns();
+
+/**
+ * Characters that are typically part of a secret token or credential string.
+ * Anything NOT matching this is treated as a word boundary for match extension.
+ */
+const INLINE_TOKEN_CHAR_RE = /[a-zA-Z0-9_\-.+\/=:@]/;
+
+// ---------------------------------------------------------------------------
+// Inline redaction
+// ---------------------------------------------------------------------------
+
+/**
+ * Replace sensitive patterns *inline* within a string value.
+ *
+ * Strategy:
+ * 1. Collect all regex match ranges across every INLINE_PATTERN.
+ * 2. Extend each range bidirectionally to the nearest "token boundary"
+ *    (whitespace, quotes, brackets, etc.) so partial regex matches still
+ *    cover the full secret token.
+ * 3. Merge overlapping/adjacent ranges.
+ * 4. Replace each merged range with [REDACTED].
+ *
+ * Returns the (possibly modified) string and how many distinct secrets were
+ * redacted. Does NOT check Shannon entropy — callers should use
+ * `isHighEntropySecret()` as a fallback when `count === 0`.
+ */
+function inlineRedactSensitiveValues(s: string): { value: string; count: number } {
+  // 1. Collect all match ranges
+  const ranges: Array<{ start: number; end: number }> = [];
+
+  for (const pattern of INLINE_PATTERNS) {
+    for (const match of s.matchAll(pattern)) {
+      let start = match.index!;
+      let end = start + match[0].length;
+
+      // Extend backward to token boundary
+      while (start > 0 && INLINE_TOKEN_CHAR_RE.test(s[start - 1])) {
+        start--;
+      }
+      // Extend forward to token boundary
+      while (end < s.length && INLINE_TOKEN_CHAR_RE.test(s[end])) {
+        end++;
+      }
+
+      ranges.push({ start, end });
+    }
+  }
+
+  if (ranges.length === 0) return { value: s, count: 0 };
+
+  // 2. Sort by start position, then by longest range first
+  ranges.sort((a, b) => a.start - b.start || b.end - a.end);
+
+  // 3. Merge overlapping / adjacent ranges
+  const merged: Array<{ start: number; end: number }> = [{ ...ranges[0] }];
+  for (let i = 1; i < ranges.length; i++) {
+    const last = merged[merged.length - 1];
+    if (ranges[i].start <= last.end) {
+      last.end = Math.max(last.end, ranges[i].end);
+    } else {
+      merged.push({ ...ranges[i] });
+    }
+  }
+
+  // 4. Build result string
+  let result = '';
+  let pos = 0;
+  for (const { start, end } of merged) {
+    result += s.slice(pos, start) + REDACTED;
+    pos = end;
+  }
+  result += s.slice(pos);
+
+  return { value: result, count: merged.length };
+}
+
+// ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
@@ -364,9 +476,16 @@ function redactObject(
       continue;
     }
 
-    // Value-based redaction + truncation
+    // Value-based redaction + truncation (inline — only matched portions replaced)
     if (typeof value === "string") {
-      if (isSensitiveValue(value)) {
+      const { value: redacted, count: inlineCount } = inlineRedactSensitiveValues(value);
+      if (inlineCount > 0) {
+        counter.count += inlineCount;
+        result[key] = redacted.length > MAX_VALUE_LENGTH
+          ? redacted.slice(0, MAX_VALUE_LENGTH) + `… [${redacted.length} chars]`
+          : redacted;
+      } else if (isHighEntropySecret(value)) {
+        // Fallback: entire value looks like a random token
         result[key] = REDACTED;
         counter.count++;
       } else if (value.length > MAX_VALUE_LENGTH) {
@@ -383,11 +502,18 @@ function redactObject(
       continue;
     }
 
-    // Arrays — redact string elements, recurse into objects
+    // Arrays — inline-redact string elements, recurse into objects
     if (Array.isArray(value)) {
       result[key] = value.map((item) => {
         if (typeof item === "string") {
-          if (isSensitiveValue(item)) {
+          const { value: redacted, count: inlineCount } = inlineRedactSensitiveValues(item);
+          if (inlineCount > 0) {
+            counter.count += inlineCount;
+            return redacted.length > MAX_VALUE_LENGTH
+              ? redacted.slice(0, MAX_VALUE_LENGTH) + `… [${redacted.length} chars]`
+              : redacted;
+          }
+          if (isHighEntropySecret(item)) {
             counter.count++;
             return REDACTED;
           }
@@ -412,4 +538,4 @@ function redactObject(
 }
 
 // Export internals for testing
-export { shannonEntropy, looksLikeToken, isHighEntropySecret, getEntropyThreshold, SENSITIVE_VALUE_PATTERNS, SENSITIVE_KEYS };
+export { shannonEntropy, looksLikeToken, isHighEntropySecret, getEntropyThreshold, inlineRedactSensitiveValues, SENSITIVE_VALUE_PATTERNS, SENSITIVE_KEYS };

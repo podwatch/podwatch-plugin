@@ -4,6 +4,7 @@ import {
   shannonEntropy,
   looksLikeToken,
   isHighEntropySecret,
+  inlineRedactSensitiveValues,
 } from "./redact.js";
 
 // Helper: assert a value is redacted when passed as a top-level param value
@@ -564,6 +565,158 @@ describe("structural behavior", () => {
     expect(items[0].name).toBe("safe");
     expect(items[1].name).toBe("also-safe");
     expect(redactedCount).toBe(1);
+  });
+});
+
+// =========================================================================
+// Inline redaction (the primary fix — only matched portions are replaced)
+// =========================================================================
+describe("inline redaction", () => {
+  it("redacts only the API key portion of a curl command", () => {
+    const { result, redactedCount } = redactParams({
+      command: 'curl -H "Authorization: Bearer sk_live_abc123def456" https://api.example.com',
+    });
+    expect(result.command).toBe(
+      'curl -H "Authorization: [REDACTED]" https://api.example.com',
+    );
+    expect(redactedCount).toBe(1);
+  });
+
+  it("redacts multiple secrets inline in a single string", () => {
+    const { result, redactedCount } = redactParams({
+      command: 'curl -H "sk_live_abc123def456" -H "ghp_' + "x".repeat(36) + '" https://api.example.com',
+    });
+    const s = result.command as string;
+    expect(s).toContain("[REDACTED]");
+    expect(s).toContain("curl");
+    expect(s).toContain("https://api.example.com");
+    expect(s).not.toContain("sk_live_");
+    expect(s).not.toContain("ghp_");
+    expect(redactedCount).toBe(2);
+  });
+
+  it("pure secret value (no surrounding text) is still fully redacted", () => {
+    const { result } = redactParams({ field: "sk_live_abc123def456" });
+    expect(result.field).toBe("[REDACTED]");
+  });
+
+  it("high-entropy string with no pattern match is still fully redacted", () => {
+    const novelToken = "xK9mQ3pR7wT2nB5vZ8cJ4hG0fL6aE1dY";
+    const { result } = redactParams({ field: novelToken });
+    expect(result.field).toBe("[REDACTED]");
+  });
+
+  it("normal command with no secrets passes through unchanged", () => {
+    const cmd = "ls -la /home/user/projects";
+    const { result, redactedCount } = redactParams({ command: cmd });
+    expect(result.command).toBe(cmd);
+    expect(redactedCount).toBe(0);
+  });
+
+  it("redacts embedded GitHub PAT in git clone command", () => {
+    const ghpToken = "ghp_" + "A".repeat(36);
+    const { result } = redactParams({
+      command: `git clone https://${ghpToken}@github.com/user/repo.git`,
+    });
+    const s = result.command as string;
+    expect(s).not.toContain("ghp_");
+    expect(s).toContain("[REDACTED]");
+    // The URL structure around the secret is preserved
+    expect(s).toContain("git clone");
+  });
+
+  it("redacts embedded Postgres connection string in env export", () => {
+    const { result } = redactParams({
+      command: 'export DATABASE_URL="postgres://admin:s3cret@db.example.com:5432/mydb"',
+    });
+    const s = result.command as string;
+    expect(s).toContain("export");
+    expect(s).toContain("[REDACTED]");
+    expect(s).not.toContain("s3cret");
+  });
+
+  it("redacts inline secrets in array elements", () => {
+    const { result, redactedCount } = redactParams({
+      args: [
+        'curl -H "Authorization: Bearer sk_live_abc123def456" https://api.example.com',
+        "normal-arg",
+        "ghp_" + "b".repeat(36),
+      ],
+    });
+    const arr = result.args as string[];
+    // First element: inline redaction preserves curl command structure
+    expect(arr[0]).toContain("curl");
+    expect(arr[0]).toContain("[REDACTED]");
+    expect(arr[0]).not.toContain("sk_live_");
+    // Second element: untouched
+    expect(arr[1]).toBe("normal-arg");
+    // Third element: fully redacted (pure secret)
+    expect(arr[2]).toBe("[REDACTED]");
+    expect(redactedCount).toBe(2);
+  });
+
+  it("key-based redaction still replaces the entire value", () => {
+    const { result } = redactParams({
+      password: "this-is-not-a-pattern-match-but-key-is-sensitive",
+    });
+    expect(result.password).toBe("[REDACTED]");
+  });
+
+  it("redacts JWT embedded in a longer command string", () => {
+    const jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U";
+    const { result } = redactParams({
+      command: `curl -H "Authorization: Bearer ${jwt}" https://api.example.com/data`,
+    });
+    const s = result.command as string;
+    expect(s).toContain("curl");
+    expect(s).toContain("https://api.example.com/data");
+    expect(s).not.toContain("eyJhbGci");
+    expect(s).toContain("[REDACTED]");
+  });
+
+  it("redacts PEM private key embedded in a command", () => {
+    const { result } = redactParams({
+      command: 'echo "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA\n-----END RSA PRIVATE KEY-----" > key.pem',
+    });
+    const s = result.command as string;
+    expect(s).toContain("echo");
+    expect(s).toContain("[REDACTED]");
+    expect(s).not.toContain("MIIEpAIBAAKCAQEA");
+  });
+});
+
+describe("inlineRedactSensitiveValues (unit)", () => {
+  it("returns count=0 and unchanged string when no secrets present", () => {
+    const { value, count } = inlineRedactSensitiveValues("hello world");
+    expect(value).toBe("hello world");
+    expect(count).toBe(0);
+  });
+
+  it("returns count=1 for a single inline secret", () => {
+    const { value, count } = inlineRedactSensitiveValues(
+      'curl -H "sk_live_abc123def456" https://api.example.com',
+    );
+    expect(count).toBe(1);
+    expect(value).toContain("[REDACTED]");
+    expect(value).toContain("curl");
+  });
+
+  it("returns count=2 for two distinct secrets", () => {
+    const ghp = "ghp_" + "a".repeat(36);
+    const { value, count } = inlineRedactSensitiveValues(
+      `first ${ghp} middle sk_live_abc123 end`,
+    );
+    expect(count).toBe(2);
+    expect(value).toBe("first [REDACTED] middle [REDACTED] end");
+  });
+
+  it("does NOT check entropy (that is the caller's job)", () => {
+    // A high-entropy string that no pattern matches
+    const token = "xK9mQ3pR7wT2nB5vZ8cJ4hG0fL6aE1dY";
+    const { value, count } = inlineRedactSensitiveValues(token);
+    // inlineRedactSensitiveValues should NOT redact it (no pattern match)
+    expect(count).toBe(0);
+    expect(value).toBe(token);
   });
 });
 
