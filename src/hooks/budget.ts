@@ -25,17 +25,21 @@ export function registerBudgetHooks(api: PluginApi, config: PodwatchConfig): voi
   api.on(
     "before_prompt_build",
     async (): Promise<{ prependContext?: string } | void> => {
-      if (!config.enableBudgetEnforcement) return;
+      try {
+        if (!config.enableBudgetEnforcement) return;
 
-      const budget = transmitter.getCachedBudget();
-      if (!budget?.hardStopActive) return;
+        const budget = transmitter.getCachedBudget();
+        if (!budget?.hardStopActive) return;
 
-      return {
-        prependContext:
-          "BUDGET HARD STOP ACTIVE. Your spending limit has been reached. " +
-          "Reply ONLY with a brief message telling the user their budget is exceeded " +
-          "and to visit podwatch.app/costs to resume. Do not use any tools. Do not perform any analysis.",
-      };
+        return {
+          prependContext:
+            "BUDGET HARD STOP ACTIVE. Your spending limit has been reached. " +
+            "Reply ONLY with a brief message telling the user their budget is exceeded " +
+            "and to visit podwatch.app/costs to resume. Do not use any tools. Do not perform any analysis.",
+        };
+      } catch (err) {
+        try { console.error("[podwatch/budget] before_prompt_build handler error:", err); } catch {}
+      }
     }
   );
 

@@ -26,8 +26,11 @@ import { registerSecurityHandlers } from "./hooks/security.js";
 // ---------------------------------------------------------------------------
 function makeMockApi(config: Record<string, unknown> = {}) {
   const hooks: Record<string, Function> = {};
+  const onFn = vi.fn((name: string, handler: Function, _opts?: any) => {
+    hooks[name] = handler;
+  });
   return {
-    on: vi.fn(),
+    on: onFn,
     registerHook: vi.fn((name: string, handler: Function, _opts?: any) => {
       hooks[name] = handler;
     }),
@@ -133,7 +136,8 @@ describe("hard stop tool blocking (security.ts)", () => {
       enableSecurityAlerts: true,
     });
 
-    const calls = mockApi.registerHook.mock.calls;
+    // Extract handler from api.on (security.ts uses api.on, not registerHook)
+    const calls = mockApi.on.mock.calls;
     const beforeCall = calls.find((c: any) => c[0] === "before_tool_call");
     beforeToolCallHandler = beforeCall![1];
   });

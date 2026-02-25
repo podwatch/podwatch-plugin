@@ -42,8 +42,8 @@ describe("security hooks", () => {
       enableSecurityAlerts: true,
     });
 
-    // Extract registered handlers (now via registerHook)
-    const calls = mockApi.registerHook.mock.calls;
+    // Extract registered handlers via api.on
+    const calls = mockApi.on.mock.calls;
     const beforeCall = calls.find((c: any) => c[0] === "before_tool_call");
     const afterCall = calls.find((c: any) => c[0] === "after_tool_call");
     beforeToolCallHandler = beforeCall![1];
@@ -329,7 +329,7 @@ describe("security hooks", () => {
         enableBudgetEnforcement: false,
         enableSecurityAlerts: false,
       });
-      const beforeCall = mockApi.registerHook.mock.calls.find((c: any) => c[0] === "before_tool_call");
+      const beforeCall = mockApi.on.mock.calls.find((c: any) => c[0] === "before_tool_call");
       handler = beforeCall![1];
     });
 

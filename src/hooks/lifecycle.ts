@@ -85,12 +85,16 @@ export function registerLifecycleHandlers(api: any, config: PodwatchConfig): voi
   api.on(
     "gateway_start",
     async (event: GatewayStartEvent): Promise<void> => {
-      // Check config changes on gateway restart (config may have changed)
-      if (api.config) {
-        checkConfigChanges(api.config);
+      try {
+        // Check config changes on gateway restart (config may have changed)
+        if (api.config) {
+          checkConfigChanges(api.config);
+        }
+        // Re-run scan as best-effort; pulse is already running
+        void runScan(api.config?.agents?.defaults?.workspace);
+      } catch (err) {
+        try { console.error("[podwatch/lifecycle] gateway_start handler error:", err); } catch {}
       }
-      // Re-run scan as best-effort; pulse is already running
-      void runScan(api.config?.agents?.defaults?.workspace);
     },
     { name: "podwatch-gateway-start" }
   );
@@ -101,26 +105,30 @@ export function registerLifecycleHandlers(api: any, config: PodwatchConfig): voi
   api.on(
     "gateway_stop",
     async (): Promise<void> => {
-      // Stop intervals
-      if (pulseTimer) {
-        clearTimeout(pulseTimer);
-        pulseTimer = null;
-      }
-      if (scanTimer) {
-        clearInterval(scanTimer);
-        scanTimer = null;
-      }
+      try {
+        // Stop intervals
+        if (pulseTimer) {
+          clearTimeout(pulseTimer);
+          pulseTimer = null;
+        }
+        if (scanTimer) {
+          clearInterval(scanTimer);
+          scanTimer = null;
+        }
 
-      // Unsubscribe from diagnostic events
-      const unsubscribe = (api as any).__podwatch_unsubscribeDiagnostics;
-      if (typeof unsubscribe === "function") {
-        unsubscribe();
+        // Unsubscribe from diagnostic events
+        const unsubscribe = (api as any).__podwatch_unsubscribeDiagnostics;
+        if (typeof unsubscribe === "function") {
+          unsubscribe();
+        }
+
+        // Flush remaining events
+        await transmitter.shutdown();
+
+        api.logger.info("[podwatch/lifecycle] Graceful shutdown complete");
+      } catch (err) {
+        try { console.error("[podwatch/lifecycle] gateway_stop handler error:", err); } catch {}
       }
-
-      // Flush remaining events
-      await transmitter.shutdown();
-
-      api.logger.info("[podwatch/lifecycle] Graceful shutdown complete");
     },
     { name: "podwatch-gateway-stop" }
   );
@@ -131,35 +139,42 @@ export function registerLifecycleHandlers(api: any, config: PodwatchConfig): voi
   api.on(
     "before_compaction",
     async (event: BeforeCompactionEvent, ctx: PluginHookAgentContext): Promise<void> => {
-      transmitter.enqueue({
-        type: "compaction",
-        ts: Date.now(),
-        messageCount: event.messageCount,
-        tokenCount: event.tokenCount,
-        sessionKey: ctx.sessionKey,
-        agentId: ctx.agentId,
-      });
+      try {
+        if (!event || typeof event !== "object") return;
+        const safeCtx = (ctx && typeof ctx === "object") ? ctx : {} as PluginHookAgentContext;
 
-      // Context pressure alert — only if both fields are available
-      if (
-        typeof event.tokenCount === "number" &&
-        typeof (event as any).contextLimit === "number"
-      ) {
-        const contextLimit = (event as any).contextLimit as number;
-        const ratio = event.tokenCount / contextLimit;
-        if (ratio > 0.8) {
-          transmitter.enqueue({
-            type: "alert",
-            ts: Date.now(),
-            severity: "warning",
-            pattern: "context_pressure",
-            tokenCount: event.tokenCount,
-            contextLimit,
-            ratio,
-            sessionKey: ctx.sessionKey,
-            agentId: ctx.agentId,
-          });
+        transmitter.enqueue({
+          type: "compaction",
+          ts: Date.now(),
+          messageCount: typeof event.messageCount === "number" ? event.messageCount : 0,
+          tokenCount: event.tokenCount,
+          sessionKey: safeCtx.sessionKey,
+          agentId: safeCtx.agentId,
+        });
+
+        // Context pressure alert — only if both fields are available
+        if (
+          typeof event.tokenCount === "number" &&
+          typeof (event as any).contextLimit === "number"
+        ) {
+          const contextLimit = (event as any).contextLimit as number;
+          const ratio = event.tokenCount / contextLimit;
+          if (ratio > 0.8) {
+            transmitter.enqueue({
+              type: "alert",
+              ts: Date.now(),
+              severity: "warning",
+              pattern: "context_pressure",
+              tokenCount: event.tokenCount,
+              contextLimit,
+              ratio,
+              sessionKey: safeCtx.sessionKey,
+              agentId: safeCtx.agentId,
+            });
+          }
         }
+      } catch (err) {
+        try { console.error("[podwatch/lifecycle] before_compaction handler error:", err); } catch {}
       }
     },
     { name: "podwatch-compaction" }

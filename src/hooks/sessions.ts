@@ -20,13 +20,20 @@ export function registerSessionHandlers(api: any): void {
   api.on(
     "session_start",
     async (event: SessionStartEvent, ctx: { agentId?: string; sessionId: string }): Promise<void> => {
-      transmitter.enqueue({
-        type: "session_start",
-        ts: Date.now(),
-        sessionId: event.sessionId,
-        resumedFrom: event.resumedFrom,
-        agentId: ctx.agentId,
-      });
+      try {
+        if (!event || typeof event !== "object") return;
+        const safeCtx = (ctx && typeof ctx === "object") ? ctx : {} as { agentId?: string; sessionId: string };
+
+        transmitter.enqueue({
+          type: "session_start",
+          ts: Date.now(),
+          sessionId: event.sessionId ?? undefined,
+          resumedFrom: event.resumedFrom,
+          agentId: safeCtx.agentId,
+        });
+      } catch (err) {
+        try { console.error("[podwatch/sessions] session_start handler error:", err); } catch {}
+      }
     },
     { name: "podwatch-session-start" }
   );
@@ -37,26 +44,35 @@ export function registerSessionHandlers(api: any): void {
   api.on(
     "session_end",
     async (event: SessionEndEvent, ctx: { agentId?: string; sessionId: string }): Promise<void> => {
-      transmitter.enqueue({
-        type: "session_end",
-        ts: Date.now(),
-        sessionId: event.sessionId,
-        messageCount: event.messageCount,
-        durationMs: event.durationMs,
-        agentId: ctx.agentId,
-      });
+      try {
+        if (!event || typeof event !== "object") return;
+        const safeCtx = (ctx && typeof ctx === "object") ? ctx : {} as { agentId?: string; sessionId: string };
 
-      // Simple loop detection: sessions with > 100 messages are suspicious
-      if (event.messageCount > 100) {
+        const messageCount = typeof event.messageCount === "number" ? event.messageCount : 0;
+
         transmitter.enqueue({
-          type: "alert",
+          type: "session_end",
           ts: Date.now(),
-          severity: "warning",
-          pattern: "session_loop_warning",
-          sessionKey: ctx.sessionId,
-          messageCount: event.messageCount,
-          agentId: ctx.agentId,
+          sessionId: event.sessionId ?? undefined,
+          messageCount,
+          durationMs: event.durationMs,
+          agentId: safeCtx.agentId,
         });
+
+        // Simple loop detection: sessions with > 100 messages are suspicious
+        if (messageCount > 100) {
+          transmitter.enqueue({
+            type: "alert",
+            ts: Date.now(),
+            severity: "warning",
+            pattern: "session_loop_warning",
+            sessionKey: safeCtx.sessionId,
+            messageCount,
+            agentId: safeCtx.agentId,
+          });
+        }
+      } catch (err) {
+        try { console.error("[podwatch/sessions] session_end handler error:", err); } catch {}
       }
     },
     { name: "podwatch-session-end" }

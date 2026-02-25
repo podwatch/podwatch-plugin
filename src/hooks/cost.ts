@@ -51,80 +51,92 @@ export function registerCostHandler(
 ): void {
   // before_agent_start carries the full message history with usage on each assistant turn
   api.on("before_agent_start", async (event: any, ctx: any) => {
-    if (!event?.messages || !Array.isArray(event.messages)) return;
+    try {
+      if (!event || typeof event !== "object") return;
+      if (!event.messages || !Array.isArray(event.messages)) return;
 
-    const sessionKey: string = ctx?.sessionKey ?? "__default__";
+      const safeCtx = (ctx && typeof ctx === "object") ? ctx : {};
+      const sessionKey: string = safeCtx?.sessionKey ?? "__default__";
 
-    // Get per-session index (defaults to 0 for new sessions)
-    let lastSeenIndex = lastSeenIndexMap.get(sessionKey) ?? 0;
+      // Get per-session index (defaults to 0 for new sessions)
+      let lastSeenIndex = lastSeenIndexMap.get(sessionKey) ?? 0;
 
-    // Bounds check: if messages were compacted, reset to 0
-    if (lastSeenIndex > event.messages.length) {
-      lastSeenIndex = 0;
-    }
-
-    // Only process new messages since last invocation
-    const newMessages = event.messages.slice(lastSeenIndex);
-    lastSeenIndexMap.set(sessionKey, event.messages.length);
-
-    if (newMessages.length === 0) return;
-
-    // Detect heartbeat-triggered turns by scanning the last user message
-    // OpenClaw heartbeat prompts always contain "HEARTBEAT" (e.g. "Read HEARTBEAT.md")
-    let isHeartbeat = false;
-    for (let i = event.messages.length - 1; i >= 0; i--) {
-      const m = event.messages[i];
-      if (m?.role === "user") {
-        const text = typeof m.content === "string" ? m.content : JSON.stringify(m.content ?? "");
-        if (/HEARTBEAT/i.test(text)) {
-          isHeartbeat = true;
-        }
-        break; // only check the last user message
+      // Bounds check: if messages were compacted, reset to 0
+      if (lastSeenIndex > event.messages.length) {
+        lastSeenIndex = 0;
       }
-    }
 
-    // Generate a turn_id for this batch of cost events (per before_agent_start invocation)
-    // This links all cost events from the same LLM turn together
-    const turnId = generateTurnId();
+      // Only process new messages since last invocation
+      const newMessages = event.messages.slice(lastSeenIndex);
+      lastSeenIndexMap.set(sessionKey, event.messages.length);
 
-    for (const msg of newMessages) {
-      // Only assistant messages have usage data
-      if (msg.role !== "assistant") continue;
-      if (!msg.usage) continue;
+      if (newMessages.length === 0) return;
 
-      // Skip zero-cost internal messages (delivery-mirror, etc.)
-      if (msg.provider === "openclaw" || msg.model === "delivery-mirror") continue;
-      if (msg.usage.totalTokens === 0 && !msg.usage.input && !msg.usage.output) continue;
+      // Detect heartbeat-triggered turns by scanning the last user message
+      // OpenClaw heartbeat prompts always contain "HEARTBEAT" (e.g. "Read HEARTBEAT.md")
+      let isHeartbeat = false;
+      for (let i = event.messages.length - 1; i >= 0; i--) {
+        const m = event.messages[i];
+        if (m?.role === "user") {
+          const text = typeof m.content === "string" ? m.content : JSON.stringify(m.content ?? "");
+          if (/HEARTBEAT/i.test(text)) {
+            isHeartbeat = true;
+          }
+          break; // only check the last user message
+        }
+      }
 
-      const costTotal = msg.usage.cost?.total ?? undefined;
+      // Generate a turn_id for this batch of cost events (per before_agent_start invocation)
+      // This links all cost events from the same LLM turn together
+      const turnId = generateTurnId();
 
-      transmitter.enqueue({
-        type: "cost",
-        ts: msg.timestamp ?? Date.now(),
-        sessionKey: ctx?.sessionKey,
-        agentId: ctx?.agentId,
-        provider: msg.provider,
-        model: msg.model,
-        inputTokens: msg.usage.input ?? 0,
-        outputTokens: msg.usage.output ?? 0,
-        cacheReadTokens: msg.usage.cacheRead ?? 0,
-        cacheWriteTokens: msg.usage.cacheWrite ?? 0,
-        totalTokens: msg.usage.totalTokens ?? ((msg.usage.input ?? 0) + (msg.usage.output ?? 0)),
-        costUsd: costTotal,
-        costBreakdown: msg.usage.cost, // full {input, output, cacheRead, cacheWrite, total} object
-        durationMs: undefined,
-        correlationId: turnId, // Link cost events per turn
-        // Tag heartbeat-triggered cost events so the dashboard can distinguish them
-        ...(isHeartbeat ? { sessionType: "heartbeat" } : {}),
-      });
+      for (const msg of newMessages) {
+        if (!msg || typeof msg !== "object") continue;
+        // Only assistant messages have usage data
+        if (msg.role !== "assistant") continue;
+        if (!msg.usage) continue;
+
+        // Skip zero-cost internal messages (delivery-mirror, etc.)
+        if (msg.provider === "openclaw" || msg.model === "delivery-mirror") continue;
+        if (msg.usage.totalTokens === 0 && !msg.usage.input && !msg.usage.output) continue;
+
+        const costTotal = msg.usage.cost?.total ?? undefined;
+
+        transmitter.enqueue({
+          type: "cost",
+          ts: msg.timestamp ?? Date.now(),
+          sessionKey: safeCtx?.sessionKey,
+          agentId: safeCtx?.agentId,
+          provider: msg.provider,
+          model: msg.model,
+          inputTokens: msg.usage.input ?? 0,
+          outputTokens: msg.usage.output ?? 0,
+          cacheReadTokens: msg.usage.cacheRead ?? 0,
+          cacheWriteTokens: msg.usage.cacheWrite ?? 0,
+          totalTokens: msg.usage.totalTokens ?? ((msg.usage.input ?? 0) + (msg.usage.output ?? 0)),
+          costUsd: costTotal,
+          costBreakdown: msg.usage.cost, // full {input, output, cacheRead, cacheWrite, total} object
+          durationMs: undefined,
+          correlationId: turnId, // Link cost events per turn
+          // Tag heartbeat-triggered cost events so the dashboard can distinguish them
+          ...(isHeartbeat ? { sessionType: "heartbeat" } : {}),
+        });
+      }
+    } catch (err) {
+      try { console.error("[podwatch/cost] before_agent_start handler error:", err); } catch {}
     }
   }, { name: "podwatch-cost" });
 
   // Clean up session index on session end to prevent memory leaks
   api.on("session_end", async (_event: any, ctx: any) => {
-    const sessionKey: string = ctx?.sessionKey;
-    if (sessionKey) {
-      lastSeenIndexMap.delete(sessionKey);
+    try {
+      const safeCtx = (ctx && typeof ctx === "object") ? ctx : {};
+      const sessionKey: string = safeCtx?.sessionKey;
+      if (sessionKey) {
+        lastSeenIndexMap.delete(sessionKey);
+      }
+    } catch (err) {
+      try { console.error("[podwatch/cost] session_end handler error:", err); } catch {}
     }
   }, { name: "podwatch-cost-cleanup" });
 
