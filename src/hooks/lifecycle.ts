@@ -18,6 +18,7 @@ import type {
 import { transmitter } from "../transmitter.js";
 import { scanSkillsAndPlugins } from "../scanner.js";
 import { initSnapshot, checkConfigChanges, resetSnapshot } from "../config-monitor.js";
+import { startAuthMonitor, stopAuthMonitor, checkAuthHealth } from "./auth-monitor.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
@@ -75,6 +76,9 @@ export function registerLifecycleHandlers(api: any, config: PodwatchConfig): voi
     scanTimer.unref();
   }
 
+  // Start auth profile health monitoring (every 15 min)
+  startAuthMonitor(900_000, undefined, endpoint, apiKey);
+
   api.logger.info(
     `[podwatch/lifecycle] Pulse & scan started from register(). Pulse: ${config.pulseIntervalMs ?? 300_000}ms, Scan: ${config.scanIntervalMs ?? 21_600_000}ms`
   );
@@ -115,6 +119,9 @@ export function registerLifecycleHandlers(api: any, config: PodwatchConfig): voi
           clearInterval(scanTimer);
           scanTimer = null;
         }
+
+        // Stop auth health monitor
+        stopAuthMonitor();
 
         // Unsubscribe from diagnostic events
         const unsubscribe = (api as any).__podwatch_unsubscribeDiagnostics;
