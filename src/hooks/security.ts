@@ -68,6 +68,13 @@ function pruneCorrelationIds(): void {
  */
 export function registerSecurityHandlers(api: any, config: PodwatchConfig): void {
   // -----------------------------------------------------------------------
+  // NOTE: All tool_call + tool_result events are sent to the dashboard.
+  // The dashboard merges tool_result into the matching tool_call row
+  // (by correlationId) so the timeline shows ONE row per tool call
+  // with a result status icon.
+  // -----------------------------------------------------------------------
+
+  // -----------------------------------------------------------------------
   // before_tool_call — security scan + budget enforcement + exfiltration
   // -----------------------------------------------------------------------
   api.on(
@@ -205,6 +212,7 @@ export function registerSecurityHandlers(api: any, config: PodwatchConfig): void
   // -----------------------------------------------------------------------
   // after_tool_call — latency + success/failure (fire-and-forget)
   // -----------------------------------------------------------------------
+
   api.on(
     "after_tool_call",
     async (event: AfterToolCallEvent, ctx: PluginHookAgentContext): Promise<void> => {
