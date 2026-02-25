@@ -22,7 +22,7 @@ export function registerBudgetHooks(api: PluginApi, config: PodwatchConfig): voi
   // -----------------------------------------------------------------------
   // before_prompt_build — inject budget warning into prompt
   // -----------------------------------------------------------------------
-  api.registerHook(
+  api.on(
     "before_prompt_build",
     async (): Promise<{ prependContext?: string } | void> => {
       if (!config.enableBudgetEnforcement) return;
@@ -36,8 +36,7 @@ export function registerBudgetHooks(api: PluginApi, config: PodwatchConfig): voi
           "Reply ONLY with a brief message telling the user their budget is exceeded " +
           "and to visit podwatch.app/costs to resume. Do not use any tools. Do not perform any analysis.",
       };
-    },
-    { name: "podwatch-budget-prompt-build" },
+    }
   );
 
   api.logger.info("[podwatch/budget] Hard stop hooks registered");

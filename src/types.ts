@@ -141,8 +141,12 @@ export interface RegisterHookOpts {
 }
 
 export interface PluginApi {
-  /** @deprecated Use registerHook() instead. Kept for backward compat with pre-2026.2.17 gateways. */
-  on: (event: PluginHookName | string, handler: (...args: unknown[]) => void | Promise<void>) => void;
+  /** Register a typed hook handler (hook runner). */
+  on: (
+    event: PluginHookName | string,
+    handler: (...args: unknown[]) => unknown | Promise<unknown>,
+    opts?: { priority?: number },
+  ) => void;
   /** Register a hook handler. `events` is a string or string[]. Requires opts.name. */
   registerHook: (
     events: PluginHookName | string | (PluginHookName | string)[],

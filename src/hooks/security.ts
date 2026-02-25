@@ -70,7 +70,7 @@ export function registerSecurityHandlers(api: any, config: PodwatchConfig): void
   // -----------------------------------------------------------------------
   // before_tool_call — security scan + budget enforcement + exfiltration
   // -----------------------------------------------------------------------
-  api.registerHook(
+  api.on(
     "before_tool_call",
     async (
       event: BeforeToolCallEvent,
@@ -121,7 +121,7 @@ export function registerSecurityHandlers(api: any, config: PodwatchConfig): void
 
       // --- B) Security alerts (if enabled) ---
       if (config.enableSecurityAlerts) {
-        const classification = classifyTool(toolName, params);
+        const classification = classifyTool(toolName, params ?? {});
 
         // B1) Exfiltration sequence detection
         if (classification.accessesCredentials) {
@@ -179,7 +179,7 @@ export function registerSecurityHandlers(api: any, config: PodwatchConfig): void
       correlationIdMap.set(corrKey, correlationId);
       pruneCorrelationIds();
 
-      const { result: redactedParams, redactedCount } = redactParams(params);
+      const { result: redactedParams, redactedCount } = redactParams(params ?? {});
       transmitter.enqueue({
         type: "tool_call",
         ts: Date.now(),
@@ -191,13 +191,13 @@ export function registerSecurityHandlers(api: any, config: PodwatchConfig): void
         agentId: ctx.agentId,
       });
     },
-    { name: "podwatch-security-scan", priority: 10 }, // Run early to block before other plugins
+    { priority: 10 }, // Run early to block before other plugins
   );
 
   // -----------------------------------------------------------------------
   // after_tool_call — latency + success/failure (fire-and-forget)
   // -----------------------------------------------------------------------
-  api.registerHook(
+  api.on(
     "after_tool_call",
     async (event: AfterToolCallEvent, ctx: PluginHookAgentContext): Promise<void> => {
       // Look up correlation ID from the map (set by before_tool_call)
@@ -215,8 +215,7 @@ export function registerSecurityHandlers(api: any, config: PodwatchConfig): void
         sessionKey: ctx.sessionKey,
         agentId: ctx.agentId,
       });
-    },
-    { name: "podwatch-tool-result" },
+    }
   );
 
   api.logger.info(
@@ -225,7 +224,7 @@ export function registerSecurityHandlers(api: any, config: PodwatchConfig): void
   );
 
   // Cleanup correlation IDs on session end to prevent memory leaks
-  api.registerHook("session_end", async (_event: unknown, ctx: PluginHookAgentContext) => {
+  api.on("session_end", async (_event: unknown, ctx: PluginHookAgentContext) => {
     const sessionKey = ctx.sessionKey;
     if (!sessionKey) return;
 
@@ -235,6 +234,6 @@ export function registerSecurityHandlers(api: any, config: PodwatchConfig): void
         correlationIdMap.delete(key);
       }
     }
-  }, { name: "podwatch-security-cleanup" });
+  });
 }
 

@@ -441,6 +441,9 @@ function auditUnredactedFields(obj: Record<string, unknown>, prefix = ''): void 
  * Returns the scrubbed object and a count of how many values were redacted.
  */
 export function redactParams(params: Record<string, unknown>): RedactResult {
+  if (!params || typeof params !== "object") {
+    return { result: {}, redactedCount: 0 };
+  }
   const counter = { count: 0 };
   const result = redactObject(params, 0, counter);
   auditUnredactedFields(result);
