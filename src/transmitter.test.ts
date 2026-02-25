@@ -3,6 +3,16 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
+// vi.mock is hoisted, so we can't read fs before the mock. Use vi.hoisted to compute version early.
+const { REAL_PKG_VERSION } = await vi.hoisted(async () => {
+  const fs = await import("node:fs");
+  const path = await import("node:path");
+  const pkg = JSON.parse(
+    fs.readFileSync(path.join(__dirname, "..", "package.json"), "utf-8")
+  );
+  return { REAL_PKG_VERSION: pkg.version as string };
+});
+
 // Mock node:fs, node:path, node:os before importing transmitter
 vi.mock("node:fs", () => ({
   appendFileSync: vi.fn(),
@@ -10,7 +20,7 @@ vi.mock("node:fs", () => ({
   statSync: vi.fn(() => { throw new Error("ENOENT"); }),
   readFileSync: vi.fn((filePath: string) => {
     if (typeof filePath === "string" && filePath.endsWith("package.json")) {
-      return JSON.stringify({ version: "1.1.0" });
+      return JSON.stringify({ version: REAL_PKG_VERSION });
     }
     return "";
   }),
@@ -411,7 +421,7 @@ describe("transmitter — M1: plugin version from package.json", () => {
     // Reset readFileSync to return package.json for version reads
     (fs.readFileSync as any).mockImplementation((filePath: string) => {
       if (typeof filePath === "string" && filePath.endsWith("package.json")) {
-        return JSON.stringify({ version: "1.1.0" });
+        return JSON.stringify({ version: REAL_PKG_VERSION });
       }
       return "";
     });
@@ -438,8 +448,7 @@ describe("transmitter — M1: plugin version from package.json", () => {
     const call = (globalThis.fetch as any).mock.calls[0];
     const body = JSON.parse(call[1].body);
     // Must match package.json version, not hardcoded "0.1.0"
-    const pkg = await import("../package.json");
-    expect(body.pluginVersion).toBe(pkg.version);
+    expect(body.pluginVersion).toBe(REAL_PKG_VERSION);
     expect(body.pluginVersion).not.toBe("0.1.0");
   });
 });
@@ -450,7 +459,7 @@ describe("transmitter — M3: audit log rotation and permissions", () => {
     // Reset readFileSync to return package.json for version reads
     (fs.readFileSync as any).mockImplementation((filePath: string) => {
       if (typeof filePath === "string" && filePath.endsWith("package.json")) {
-        return JSON.stringify({ version: "1.1.0" });
+        return JSON.stringify({ version: REAL_PKG_VERSION });
       }
       return "";
     });
@@ -486,7 +495,7 @@ describe("transmitter — M3: audit log rotation and permissions", () => {
     const bigContent = "A".repeat(500_000) + "\n" + "B".repeat(500_000) + "\n";
     (fs.readFileSync as any).mockImplementation((filePath: string) => {
       if (typeof filePath === "string" && filePath.endsWith("package.json")) {
-        return JSON.stringify({ version: "1.1.0" });
+        return JSON.stringify({ version: REAL_PKG_VERSION });
       }
       return bigContent;
     });

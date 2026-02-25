@@ -70,8 +70,10 @@ describe("lifecycle — scanner 30s delay", () => {
     const scanEvents = getEnqueued().filter((e: any) => e.type === "scan");
     expect(scanEvents).toHaveLength(0);
 
-    // Advance 30s — scan should fire
-    vi.advanceTimersByTime(30_000);
+    // Advance 30s — scan should fire (async: setTimeout fires runScan which is a promise)
+    await vi.advanceTimersByTimeAsync(30_000);
+    // Flush any remaining microtasks from the async scan
+    await new Promise(r => process.nextTick(r));
     const scanEventsAfter = getEnqueued().filter((e: any) => e.type === "scan");
     expect(scanEventsAfter).toHaveLength(1);
   });
