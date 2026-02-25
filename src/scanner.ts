@@ -27,15 +27,37 @@ interface ScannedItem {
   riskIndicators?: string[];
 }
 
+interface ScanChanges {
+  newSkills: string[];
+  removedSkills: string[];
+  newPlugins: string[];
+  removedPlugins: string[];
+}
+
 interface ScanResults {
   skills: ScannedItem[];
   plugins: ScannedItem[];
+  totalSkills: number;
+  totalPlugins: number;
+  changes: ScanChanges | null;
   scannedAt: number;
 }
 
 // ---------------------------------------------------------------------------
 // Scanner
 // ---------------------------------------------------------------------------
+
+// Track last scan results for change detection
+let lastSkillNames: Set<string> | null = null;
+let lastPluginNames: Set<string> | null = null;
+
+/**
+ * Reset last scan state (for testing).
+ */
+export function resetLastScan(): void {
+  lastSkillNames = null;
+  lastPluginNames = null;
+}
 
 export async function scanSkillsAndPlugins(workspaceDir?: string): Promise<ScanResults> {
   const home = homedir();
@@ -68,9 +90,32 @@ export async function scanSkillsAndPlugins(workspaceDir?: string): Promise<ScanR
     plugins
   );
 
+  // Compute changes against last scan
+  const currentSkillNames = new Set(skills.map(s => s.name));
+  const currentPluginNames = new Set(plugins.map(p => p.name));
+
+  let changes: ScanChanges | null = null;
+  if (lastSkillNames !== null || lastPluginNames !== null) {
+    const prevSkills = lastSkillNames ?? new Set<string>();
+    const prevPlugins = lastPluginNames ?? new Set<string>();
+    changes = {
+      newSkills: [...currentSkillNames].filter(n => !prevSkills.has(n)),
+      removedSkills: [...prevSkills].filter(n => !currentSkillNames.has(n)),
+      newPlugins: [...currentPluginNames].filter(n => !prevPlugins.has(n)),
+      removedPlugins: [...prevPlugins].filter(n => !currentPluginNames.has(n)),
+    };
+  }
+
+  // Store for next comparison
+  lastSkillNames = currentSkillNames;
+  lastPluginNames = currentPluginNames;
+
   return {
     skills,
     plugins,
+    totalSkills: skills.length,
+    totalPlugins: plugins.length,
+    changes,
     scannedAt: Date.now(),
   };
 }

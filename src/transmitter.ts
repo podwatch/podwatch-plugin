@@ -201,6 +201,23 @@ function buildDescription(event: PodwatchEvent): string {
       if (typeof event.durationMs === "number") parts.push(`duration=${Math.round(Number(event.durationMs) / 1000)}s`);
       break;
     }
+    case "compaction": {
+      const msgCount = typeof event.messageCount === "number" ? event.messageCount : 0;
+      if (typeof event.contextPercent === "number") {
+        parts.push(`Context: ${event.contextPercent}% → compacted (${msgCount.toLocaleString()} messages)`);
+      } else {
+        parts.push(`Compacted ${msgCount.toLocaleString()} messages`);
+        if (typeof event.tokenCount === "number") parts.push(`${event.tokenCount.toLocaleString()} tokens`);
+      }
+      if (event.trigger) parts.push(`trigger=${event.trigger}`);
+      break;
+    }
+    case "scan": {
+      const totalSkills = typeof event.totalSkills === "number" ? event.totalSkills : 0;
+      const totalPlugins = typeof event.totalPlugins === "number" ? event.totalPlugins : 0;
+      parts.push(`Found ${totalSkills} skills, ${totalPlugins} plugins`);
+      break;
+    }
     default: {
       if (event.type) parts.push(String(event.type));
       if (event.toolName) parts.push(String(event.toolName));
@@ -320,6 +337,28 @@ function transformEvents(events: PodwatchEvent[]): Record<string, unknown>[] {
     if (typeof event.cacheWriteTokens === "number") transformed.cacheWriteTokens = event.cacheWriteTokens;
     if (typeof event.durationMs === "number") transformed.durationMs = event.durationMs;
     if (event.params != null) transformed.toolArgs = event.params;
+
+    // Package enriched data for specific event types into toolArgs
+    if (event.type === "compaction" && !transformed.toolArgs) {
+      const compactionArgs: Record<string, unknown> = {};
+      if (typeof event.messageCount === "number") compactionArgs.messageCount = event.messageCount;
+      if (typeof event.tokenCount === "number") compactionArgs.tokenCount = event.tokenCount;
+      if (typeof event.contextLimit === "number") compactionArgs.contextLimit = event.contextLimit;
+      if (typeof event.contextPercent === "number") compactionArgs.contextPercent = event.contextPercent;
+      if (event.trigger != null) compactionArgs.trigger = event.trigger;
+      if (Object.keys(compactionArgs).length > 0) transformed.toolArgs = compactionArgs;
+    }
+
+    if (event.type === "scan" && !transformed.toolArgs) {
+      const scanArgs: Record<string, unknown> = {};
+      if (Array.isArray(event.skills)) scanArgs.skills = (event.skills as any[]).map((s: any) => s.name ?? s);
+      if (Array.isArray(event.plugins)) scanArgs.plugins = (event.plugins as any[]).map((p: any) => ({ name: p.name ?? p, version: p.version }));
+      if (typeof event.totalSkills === "number") scanArgs.totalSkills = event.totalSkills;
+      if (typeof event.totalPlugins === "number") scanArgs.totalPlugins = event.totalPlugins;
+      if (event.changes != null) scanArgs.changes = event.changes;
+      if (Object.keys(scanArgs).length > 0) transformed.toolArgs = scanArgs;
+    }
+
     if (typeof event.redactedCount === "number") transformed.redactedCount = event.redactedCount;
     if (typeof event.correlationId === "string") transformed.correlationId = event.correlationId;
 

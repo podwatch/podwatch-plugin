@@ -19,6 +19,7 @@ import { transmitter } from "../transmitter.js";
 import { scanSkillsAndPlugins } from "../scanner.js";
 import { initSnapshot, checkConfigChanges, resetSnapshot } from "../config-monitor.js";
 import { startAuthMonitor, stopAuthMonitor, checkAuthHealth } from "./auth-monitor.js";
+import { startChannelMonitor, stopChannelMonitor } from "./channel-monitor.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
@@ -79,6 +80,9 @@ export function registerLifecycleHandlers(api: any, config: PodwatchConfig): voi
   // Start auth profile health monitoring (every 15 min)
   startAuthMonitor(900_000, undefined, endpoint, apiKey);
 
+  // Start channel connectivity monitoring (every 5 min)
+  startChannelMonitor(300_000, undefined, endpoint, apiKey);
+
   api.logger.info(
     `[podwatch/lifecycle] Pulse & scan started from register(). Pulse: ${config.pulseIntervalMs ?? 300_000}ms, Scan: ${config.scanIntervalMs ?? 21_600_000}ms`
   );
@@ -123,6 +127,9 @@ export function registerLifecycleHandlers(api: any, config: PodwatchConfig): voi
         // Stop auth health monitor
         stopAuthMonitor();
 
+        // Stop channel health monitor
+        stopChannelMonitor();
+
         // Unsubscribe from diagnostic events
         const unsubscribe = (api as any).__podwatch_unsubscribeDiagnostics;
         if (typeof unsubscribe === "function") {
@@ -150,11 +157,25 @@ export function registerLifecycleHandlers(api: any, config: PodwatchConfig): voi
         if (!event || typeof event !== "object") return;
         const safeCtx = (ctx && typeof ctx === "object") ? ctx : {} as PluginHookAgentContext;
 
+        const tokenCount = typeof event.tokenCount === "number" ? event.tokenCount : undefined;
+        const contextLimit = typeof (event as any).contextLimit === "number"
+          ? (event as any).contextLimit as number
+          : undefined;
+        const contextPercent = (typeof tokenCount === "number" && typeof contextLimit === "number" && contextLimit > 0)
+          ? Math.round((tokenCount / contextLimit) * 100)
+          : undefined;
+        const trigger = typeof (event as any).trigger === "string"
+          ? (event as any).trigger
+          : undefined;
+
         transmitter.enqueue({
           type: "compaction",
           ts: Date.now(),
           messageCount: typeof event.messageCount === "number" ? event.messageCount : 0,
-          tokenCount: event.tokenCount,
+          tokenCount,
+          contextLimit,
+          contextPercent,
+          trigger,
           sessionKey: safeCtx.sessionKey,
           agentId: safeCtx.agentId,
         });
@@ -212,18 +233,45 @@ async function sendPulseWithBackoff(
   }
   let success = false;
   try {
+    // Build enriched pulse payload
+    const pulsePayload: Record<string, unknown> = {
+      ts: Date.now(),
+      bufferedEvents: transmitter.bufferedCount,
+      uptimeHours: transmitter.getAgentUptimeHours(),
+      pluginVersion: PLUGIN_VERSION,
+    };
+
+    // Enrich with system/context info — wrapped in try/catch so failures don't break pulse
+    try {
+      pulsePayload.nodeVersion = process.version;
+      pulsePayload.platform = process.platform;
+    } catch { /* safe to ignore */ }
+
+    try {
+      // Context window info from diagnostic events or config
+      const contextLimit = api?.config?.agents?.defaults?.contextTokens
+        ?? api?.config?.agents?.defaults?.maxContextTokens;
+      if (typeof contextLimit === "number") {
+        pulsePayload.contextLimit = contextLimit;
+      }
+    } catch { /* safe to ignore */ }
+
+    try {
+      // Active sessions count — check if runtime info is available
+      const activeSessions = api?.runtime?.activeSessions
+        ?? api?.runtime?.sessionCount;
+      if (typeof activeSessions === "number") {
+        pulsePayload.activeSessions = activeSessions;
+      }
+    } catch { /* safe to ignore */ }
+
     const response = await fetch(`${endpoint}/pulse`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         "Authorization": `Bearer ${apiKey}`,
       },
-      body: JSON.stringify({
-        ts: Date.now(),
-        bufferedEvents: transmitter.bufferedCount,
-        uptimeHours: transmitter.getAgentUptimeHours(),
-        pluginVersion: PLUGIN_VERSION,
-      }),
+      body: JSON.stringify(pulsePayload),
       signal: AbortSignal.timeout(10_000),
     });
     if (response.ok) {
