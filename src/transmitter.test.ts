@@ -438,7 +438,8 @@ describe("transmitter — M1: plugin version from package.json", () => {
     const call = (globalThis.fetch as any).mock.calls[0];
     const body = JSON.parse(call[1].body);
     // Must match package.json version, not hardcoded "0.1.0"
-    expect(body.pluginVersion).toBe("1.1.2");
+    const pkg = await import("../package.json");
+    expect(body.pluginVersion).toBe(pkg.version);
     expect(body.pluginVersion).not.toBe("0.1.0");
   });
 });
