@@ -20,6 +20,7 @@ import { scanSkillsAndPlugins } from "../scanner.js";
 import { initSnapshot, checkConfigChanges, resetSnapshot } from "../config-monitor.js";
 import { startAuthMonitor, stopAuthMonitor, checkAuthHealth } from "./auth-monitor.js";
 import { startChannelMonitor, stopChannelMonitor } from "./channel-monitor.js";
+import { startConfigDoctor, stopConfigDoctor } from "./config-doctor.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
@@ -82,6 +83,9 @@ export function registerLifecycleHandlers(api: any, config: PodwatchConfig): voi
 
   // Start channel connectivity monitoring (every 5 min)
   startChannelMonitor(300_000, undefined, endpoint, apiKey);
+
+  // Start config health doctor (every 15 min)
+  startConfigDoctor(900_000, undefined, endpoint, apiKey);
 
   api.logger.info(
     `[podwatch/lifecycle] Pulse & scan started from register(). Pulse: ${config.pulseIntervalMs ?? 300_000}ms, Scan: ${config.scanIntervalMs ?? 21_600_000}ms`
