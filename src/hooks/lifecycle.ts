@@ -21,6 +21,7 @@ import { initSnapshot, checkConfigChanges, resetSnapshot } from "../config-monit
 import { startAuthMonitor, stopAuthMonitor, checkAuthHealth } from "./auth-monitor.js";
 import { startChannelMonitor, stopChannelMonitor } from "./channel-monitor.js";
 import { startConfigDoctor, stopConfigDoctor } from "./config-doctor.js";
+import { stopMemoryWatcher } from "../memory-watcher.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
@@ -133,6 +134,9 @@ export function registerLifecycleHandlers(api: any, config: PodwatchConfig): voi
 
         // Stop channel health monitor
         stopChannelMonitor();
+
+        // Stop memory file watcher
+        stopMemoryWatcher();
 
         // Unsubscribe from diagnostic events
         const unsubscribe = (api as any).__podwatch_unsubscribeDiagnostics;

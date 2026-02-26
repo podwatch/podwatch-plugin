@@ -175,6 +175,7 @@ function buildDescription(event: PodwatchEvent): string {
       const status = event.success === false ? "error" : "success";
       parts.push(`${name}: ${status}`);
       if (event.error) parts.push(String(event.error).slice(0, 200));
+      if (event.resultPreview) parts.push(String(event.resultPreview));
       break;
     }
     case "cost": {
@@ -357,6 +358,14 @@ function transformEvents(events: PodwatchEvent[]): Record<string, unknown>[] {
       if (typeof event.totalPlugins === "number") scanArgs.totalPlugins = event.totalPlugins;
       if (event.changes != null) scanArgs.changes = event.changes;
       if (Object.keys(scanArgs).length > 0) transformed.toolArgs = scanArgs;
+    }
+
+    // Include resultPreview in toolArgs for tool_result events
+    if (event.type === "tool_result" && event.resultPreview) {
+      transformed.toolArgs = {
+        ...((transformed.toolArgs as Record<string, unknown>) || {}),
+        resultPreview: event.resultPreview,
+      };
     }
 
     if (typeof event.redactedCount === "number") transformed.redactedCount = event.redactedCount;

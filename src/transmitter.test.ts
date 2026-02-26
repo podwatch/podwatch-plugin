@@ -539,3 +539,95 @@ describe("transmitter — M3: audit log rotation and permissions", () => {
     expect(appendCall[2]).toEqual({ mode: 0o600 });
   });
 });
+
+// ---------------------------------------------------------------------------
+// resultPreview in transformEvents
+// ---------------------------------------------------------------------------
+describe("resultPreview in transformed events", () => {
+  beforeEach(() => {
+    transmitter.start({
+      apiKey: "test-key",
+      endpoint: "https://podwatch.app/api",
+      batchSize: 50,
+      flushIntervalMs: 999_999,
+    });
+  });
+
+  afterEach(() => {
+    transmitter.stop();
+    globalThis.fetch = originalFetch;
+  });
+
+  it("includes resultPreview in toolArgs for tool_result events", async () => {
+    mockFetch(200);
+    transmitter.enqueue({
+      type: "tool_result",
+      ts: Date.now(),
+      toolName: "read",
+      success: true,
+      resultPreview: "Hello world content",
+    });
+    await transmitter.flush();
+
+    const fetchCall = (globalThis.fetch as any).mock.calls[0];
+    const body = JSON.parse(fetchCall[1].body);
+    const event = body.events[0];
+    expect(event.toolArgs).toBeDefined();
+    expect(event.toolArgs.resultPreview).toBe("Hello world content");
+  });
+
+  it("merges resultPreview with existing toolArgs (params)", async () => {
+    mockFetch(200);
+    transmitter.enqueue({
+      type: "tool_result",
+      ts: Date.now(),
+      toolName: "exec",
+      success: true,
+      params: { command: "ls -la" },
+      resultPreview: "total 42",
+    });
+    await transmitter.flush();
+
+    const fetchCall = (globalThis.fetch as any).mock.calls[0];
+    const body = JSON.parse(fetchCall[1].body);
+    const event = body.events[0];
+    expect(event.toolArgs.command).toBe("ls -la");
+    expect(event.toolArgs.resultPreview).toBe("total 42");
+  });
+
+  it("does NOT include resultPreview when absent", async () => {
+    mockFetch(200);
+    transmitter.enqueue({
+      type: "tool_result",
+      ts: Date.now(),
+      toolName: "read",
+      success: true,
+    });
+    await transmitter.flush();
+
+    const fetchCall = (globalThis.fetch as any).mock.calls[0];
+    const body = JSON.parse(fetchCall[1].body);
+    const event = body.events[0];
+    // toolArgs should be undefined or not have resultPreview
+    if (event.toolArgs) {
+      expect(event.toolArgs.resultPreview).toBeUndefined();
+    }
+  });
+
+  it("includes resultPreview in description for tool_result events", async () => {
+    mockFetch(200);
+    transmitter.enqueue({
+      type: "tool_result",
+      ts: Date.now(),
+      toolName: "read",
+      success: true,
+      resultPreview: "File content here",
+    });
+    await transmitter.flush();
+
+    const fetchCall = (globalThis.fetch as any).mock.calls[0];
+    const body = JSON.parse(fetchCall[1].body);
+    const event = body.events[0];
+    expect(event.description).toContain("File content here");
+  });
+});

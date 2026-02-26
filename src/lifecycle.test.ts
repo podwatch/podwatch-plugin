@@ -17,6 +17,7 @@ import { registerLifecycleHandlers } from "./hooks/lifecycle.js";
 import { transmitter } from "./transmitter.js";
 import * as configMonitor from "./config-monitor.js";
 import * as authMonitor from "./hooks/auth-monitor.js";
+import * as memoryWatcher from "./memory-watcher.js";
 
 // Spy on config-monitor functions so we can assert calls without mocking
 const checkConfigChangesSpy = vi.spyOn(configMonitor, "checkConfigChanges");
@@ -26,6 +27,9 @@ const resetSnapshotSpy = vi.spyOn(configMonitor, "resetSnapshot");
 // Spy on auth-monitor to prevent actual file reads and fetch calls in lifecycle tests
 const startAuthMonitorSpy = vi.spyOn(authMonitor, "startAuthMonitor").mockImplementation(() => {});
 const stopAuthMonitorSpy = vi.spyOn(authMonitor, "stopAuthMonitor").mockImplementation(() => {});
+
+// Spy on memory-watcher to prevent actual file watchers in lifecycle tests
+const stopMemoryWatcherSpy = vi.spyOn(memoryWatcher, "stopMemoryWatcher").mockImplementation(() => {});
 
 function getEnqueued(): any[] {
   return (transmitter as any)._enqueuedEvents;

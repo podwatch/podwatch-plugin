@@ -57,6 +57,9 @@ let currentEndpoint = "";
 let currentApiKey = "";
 let isActive = false;
 
+/** Overridable fetch for testing (avoids globalThis.fetch contamination in Bun single-process). */
+let _fetch: typeof fetch = globalThis.fetch;
+
 // ─────────────────────────────────────────────────────────────
 // Diff Algorithm (LCS-based unified diff)
 // ─────────────────────────────────────────────────────────────
@@ -262,7 +265,7 @@ export function computeUnifiedDiff(
 /**
  * Count lines added and removed from a diff string.
  */
-function countDiffChanges(diff: string): { linesAdded: number; linesRemoved: number } {
+export function countDiffChanges(diff: string): { linesAdded: number; linesRemoved: number } {
   let linesAdded = 0;
   let linesRemoved = 0;
   for (const line of diff.split("\n")) {
@@ -282,7 +285,7 @@ async function sendSnapshot(
   snapshot: MemorySnapshot
 ): Promise<void> {
   try {
-    const res = await fetch(`${endpoint}/memory/snapshot`, {
+    const res = await _fetch(`${endpoint}/memory/snapshot`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -305,7 +308,7 @@ async function sendSnapshot(
 /**
  * Check if a relative path is a file we should watch.
  */
-function isWatchedFile(relativePath: string): boolean {
+export function isWatchedFile(relativePath: string): boolean {
   // Root core files
   if (CORE_ROOT_FILES.has(relativePath)) return true;
 
@@ -401,6 +404,80 @@ async function sendInitialSnapshots(
   }
 
   await Promise.allSettled(promises);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Snapshot Builder (pure function — testable without mocks)
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * Build a snapshot object from old and new content.
+ * Returns null if content is unchanged.
+ *
+ * @param filePath - relative file path (e.g. "SOUL.md", "memory/daily.md")
+ * @param oldContent - previous content (null = new file)
+ * @param newContent - current content (null = deleted file)
+ */
+export function buildSnapshot(
+  filePath: string,
+  oldContent: string | null,
+  newContent: string | null
+): MemorySnapshot | null {
+  // Delete
+  if (newContent === null) {
+    const oldLineCount = oldContent ? oldContent.split("\n").filter((l) => l !== "").length : 0;
+    return {
+      filePath,
+      changeType: "delete",
+      diff: "",
+      content: "",
+      sizeBytes: 0,
+      lineCount: 0,
+      linesAdded: 0,
+      linesRemoved: oldLineCount,
+      timestamp: new Date().toISOString(),
+    };
+  }
+
+  // Create
+  if (oldContent === null) {
+    const lineCount = newContent.split("\n").filter((l) => l !== "").length;
+    return {
+      filePath,
+      changeType: "create",
+      diff: "",
+      content: newContent,
+      sizeBytes: Buffer.byteLength(newContent, "utf-8"),
+      lineCount,
+      linesAdded: lineCount,
+      linesRemoved: 0,
+      timestamp: new Date().toISOString(),
+    };
+  }
+
+  // Unchanged
+  if (oldContent === newContent) return null;
+
+  // Modify
+  let diff = computeUnifiedDiff(oldContent, newContent, filePath);
+  if (diff.length > MAX_DIFF_SIZE) {
+    diff = diff.slice(0, MAX_DIFF_SIZE) + "\n[diff truncated]";
+  }
+
+  const { linesAdded, linesRemoved } = countDiffChanges(diff);
+  const lineCount = newContent.split("\n").filter((l) => l !== "").length;
+
+  return {
+    filePath,
+    changeType: "modify",
+    diff,
+    content: newContent,
+    sizeBytes: Buffer.byteLength(newContent, "utf-8"),
+    lineCount,
+    linesAdded,
+    linesRemoved,
+    timestamp: new Date().toISOString(),
+  };
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -640,6 +717,16 @@ export function stopMemoryWatcher(): void {
 // ─────────────────────────────────────────────────────────────
 // Test Helpers (exported for testing only)
 // ─────────────────────────────────────────────────────────────
+
+/** @internal — for tests only: override the fetch function */
+export function _testSetFetch(fn: typeof fetch): void {
+  _fetch = fn;
+}
+
+/** @internal — for tests only: restore the default fetch */
+export function _testResetFetch(): void {
+  _fetch = globalThis.fetch;
+}
 
 /** @internal — for tests only */
 export function _testGetSnapshots(): Map<string, string> {

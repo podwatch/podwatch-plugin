@@ -118,6 +118,8 @@ export interface TransmitterConfig {
 export interface PodwatchEvent {
   type: string;
   ts: number;
+  /** First 200 chars of tool result (only for tool_result events, absent on errors). */
+  resultPreview?: string;
   [key: string]: unknown;
 }
 

@@ -226,6 +226,23 @@ export function registerSecurityHandlers(api: any, config: PodwatchConfig): void
         const corrKey = buildCorrelationKey(safeCtx.sessionKey, toolName);
         const correlationId = correlationIdMap.get(corrKey);
 
+        // Extract result preview (first 200 chars, secrets redacted)
+        let resultPreview: string | undefined;
+        if (event.result != null && !event.error) {
+          const raw = typeof event.result === 'string' ? event.result : JSON.stringify(event.result);
+          let preview = raw.slice(0, 200);
+          if (raw.length > 200) preview += '…';
+          // Redact potential secrets
+          preview = preview.replace(/\b(sk-[a-zA-Z0-9]{10,})/g, '[REDACTED]');
+          preview = preview.replace(/token=[^\s&"']+/gi, 'token=[REDACTED]');
+          preview = preview.replace(/\b(ghp_[a-zA-Z0-9]{36,})/g, '[REDACTED]');
+          preview = preview.replace(/\b(xox[bpras]-[a-zA-Z0-9-]+)/g, '[REDACTED]');
+          preview = preview.replace(/(Bearer\s+)[^\s"']+/gi, '$1[REDACTED]');
+          preview = preview.replace(/\b(eyJ[a-zA-Z0-9_-]{20,}\.eyJ[a-zA-Z0-9_-]+[a-zA-Z0-9_.=-]*)/g, '[REDACTED]');
+          preview = preview.replace(/(password|secret|api_key|apikey|access_key|private_key)\s*[:=]\s*[^\s"',;}{]+/gi, '$1=[REDACTED]');
+          resultPreview = preview;
+        }
+
         transmitter.enqueue({
           type: "tool_result",
           ts: Date.now(),
@@ -233,6 +250,7 @@ export function registerSecurityHandlers(api: any, config: PodwatchConfig): void
           durationMs: event.durationMs,
           success: !event.error,
           error: event.error ? String(event.error).slice(0, 500) : undefined,
+          resultPreview,
           correlationId,
           sessionKey: safeCtx.sessionKey,
           agentId: safeCtx.agentId,

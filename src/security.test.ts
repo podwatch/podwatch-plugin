@@ -313,6 +313,148 @@ describe("security hooks", () => {
       );
       expect(resultEvent![0].error!.length).toBeLessThanOrEqual(500);
     });
+
+    it("captures resultPreview from event.result (string)", async () => {
+      await afterToolCallHandler(
+        { toolName: "read", params: {}, result: "Hello world content", durationMs: 10 },
+        defaultCtx
+      );
+
+      const resultEvent = mockEnqueue.mock.calls.find(
+        (c: any) => c[0].type === "tool_result"
+      );
+      expect(resultEvent).toBeTruthy();
+      expect(resultEvent![0].resultPreview).toBe("Hello world content");
+    });
+
+    it("captures resultPreview from event.result (object)", async () => {
+      await afterToolCallHandler(
+        { toolName: "exec", params: {}, result: { stdout: "ok", code: 0 }, durationMs: 5 },
+        defaultCtx
+      );
+
+      const resultEvent = mockEnqueue.mock.calls.find(
+        (c: any) => c[0].type === "tool_result"
+      );
+      expect(resultEvent).toBeTruthy();
+      expect(resultEvent![0].resultPreview).toBe('{"stdout":"ok","code":0}');
+    });
+
+    it("truncates resultPreview at 200 chars with ellipsis", async () => {
+      const longResult = "a".repeat(300);
+      await afterToolCallHandler(
+        { toolName: "read", params: {}, result: longResult, durationMs: 10 },
+        defaultCtx
+      );
+
+      const resultEvent = mockEnqueue.mock.calls.find(
+        (c: any) => c[0].type === "tool_result"
+      );
+      expect(resultEvent![0].resultPreview!.length).toBe(201); // 200 + "…"
+      expect(resultEvent![0].resultPreview!.endsWith("…")).toBe(true);
+    });
+
+    it("does NOT capture resultPreview when event has error", async () => {
+      await afterToolCallHandler(
+        { toolName: "exec", params: {}, result: "some output", error: "failed", durationMs: 10 },
+        defaultCtx
+      );
+
+      const resultEvent = mockEnqueue.mock.calls.find(
+        (c: any) => c[0].type === "tool_result"
+      );
+      expect(resultEvent![0].resultPreview).toBeUndefined();
+    });
+
+    it("does NOT capture resultPreview when event.result is null", async () => {
+      await afterToolCallHandler(
+        { toolName: "read", params: {}, result: null, durationMs: 10 },
+        defaultCtx
+      );
+
+      const resultEvent = mockEnqueue.mock.calls.find(
+        (c: any) => c[0].type === "tool_result"
+      );
+      expect(resultEvent![0].resultPreview).toBeUndefined();
+    });
+
+    it("redacts sk- tokens in resultPreview", async () => {
+      await afterToolCallHandler(
+        { toolName: "read", params: {}, result: "key: sk-proj-abcdefghijklmnop12345", durationMs: 10 },
+        defaultCtx
+      );
+
+      const resultEvent = mockEnqueue.mock.calls.find(
+        (c: any) => c[0].type === "tool_result"
+      );
+      expect(resultEvent![0].resultPreview).not.toContain("sk-proj");
+      expect(resultEvent![0].resultPreview).toContain("[REDACTED]");
+    });
+
+    it("redacts token= patterns in resultPreview", async () => {
+      await afterToolCallHandler(
+        { toolName: "exec", params: {}, result: "url?token=abc123secret&foo=bar", durationMs: 10 },
+        defaultCtx
+      );
+
+      const resultEvent = mockEnqueue.mock.calls.find(
+        (c: any) => c[0].type === "tool_result"
+      );
+      expect(resultEvent![0].resultPreview).not.toContain("abc123secret");
+      expect(resultEvent![0].resultPreview).toContain("[REDACTED]");
+    });
+
+    it("redacts GitHub PATs in resultPreview", async () => {
+      await afterToolCallHandler(
+        { toolName: "read", params: {}, result: "ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", durationMs: 10 },
+        defaultCtx
+      );
+
+      const resultEvent = mockEnqueue.mock.calls.find(
+        (c: any) => c[0].type === "tool_result"
+      );
+      expect(resultEvent![0].resultPreview).not.toContain("ghp_");
+      expect(resultEvent![0].resultPreview).toContain("[REDACTED]");
+    });
+
+    it("redacts Bearer tokens in resultPreview", async () => {
+      await afterToolCallHandler(
+        { toolName: "exec", params: {}, result: "Authorization: Bearer mySecretToken123", durationMs: 10 },
+        defaultCtx
+      );
+
+      const resultEvent = mockEnqueue.mock.calls.find(
+        (c: any) => c[0].type === "tool_result"
+      );
+      expect(resultEvent![0].resultPreview).not.toContain("mySecretToken123");
+      expect(resultEvent![0].resultPreview).toContain("[REDACTED]");
+    });
+
+    it("redacts JWTs in resultPreview", async () => {
+      await afterToolCallHandler(
+        { toolName: "exec", params: {}, result: "token: eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature", durationMs: 10 },
+        defaultCtx
+      );
+
+      const resultEvent = mockEnqueue.mock.calls.find(
+        (c: any) => c[0].type === "tool_result"
+      );
+      expect(resultEvent![0].resultPreview).not.toContain("eyJhbGci");
+      expect(resultEvent![0].resultPreview).toContain("[REDACTED]");
+    });
+
+    it("redacts password= patterns in resultPreview", async () => {
+      await afterToolCallHandler(
+        { toolName: "read", params: {}, result: "config password=mySuperSecret123 more", durationMs: 10 },
+        defaultCtx
+      );
+
+      const resultEvent = mockEnqueue.mock.calls.find(
+        (c: any) => c[0].type === "tool_result"
+      );
+      expect(resultEvent![0].resultPreview).not.toContain("mySuperSecret123");
+      expect(resultEvent![0].resultPreview).toContain("[REDACTED]");
+    });
   });
 
   // -----------------------------------------------------------------------

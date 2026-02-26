@@ -19,6 +19,7 @@ import { registerLifecycleHandlers } from "./hooks/lifecycle.js";
 import { registerBudgetHooks } from "./hooks/budget.js";
 import { transmitter } from "./transmitter.js";
 import { scheduleUpdateCheck } from "./updater.js";
+import { startMemoryWatcher } from "./memory-watcher.js";
 
 // ---------------------------------------------------------------------------
 // Plugin config interface
@@ -127,6 +128,14 @@ export default function register(api: PluginApi): void {
   const currentVersion = api.version ?? "0.0.0";
   const endpoint = config.endpoint ?? "https://podwatch.app/api";
   scheduleUpdateCheck(currentVersion, endpoint, api.logger, { autoUpdate: config.autoUpdate });
+
+  // Start memory file watcher (non-blocking)
+  const workspaceDir = api.config?.agents?.defaults?.workspace;
+  if (workspaceDir) {
+    startMemoryWatcher(workspaceDir, endpoint, config.apiKey);
+  } else {
+    api.logger.warn("[podwatch] No workspace directory configured — memory watcher disabled");
+  }
 
   api.logger.info(
     `[podwatch] Plugin loaded (v${currentVersion}). Budget enforcement: ${config.enableBudgetEnforcement ? "ON" : "OFF"}, ` +
