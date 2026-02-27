@@ -176,7 +176,9 @@ describe("lifecycle — pulse backoff on failure", () => {
    * flush lets the promise resolve and the function finish (including scheduling
    * the next setTimeout).
    */
-  const tick = () => Promise.resolve();
+  const tick = async () => { for (let i = 0; i < 10; i++) await Promise.resolve(); };
+  /** Count only pulse calls (ignoring channel/auth/config monitor fetch calls) */
+  const pulseCalls = () => fetchMock.mock.calls.filter((c: any) => String(c[0]).includes("/pulse")).length;
 
   beforeEach(() => {
     vi.useFakeTimers();
@@ -198,26 +200,26 @@ describe("lifecycle — pulse backoff on failure", () => {
     await tick(); // let initial pulse complete & schedule next timeout
 
     // Initial pulse call (from register)
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(pulseCalls()).toBe(1);
 
     // Advance 5min — 2nd pulse (failure #2)
     vi.advanceTimersByTime(300_000);
     await tick();
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(pulseCalls()).toBe(2);
 
     // Advance 5min — 3rd pulse (failure #3 — triggers backoff)
     vi.advanceTimersByTime(300_000);
     await tick();
-    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(pulseCalls()).toBe(3);
 
     // After 3 failures, the interval should have increased.
     // At normal 5min interval, the next pulse would fire at +5min.
     // With backoff (10min), no pulse should fire at the normal +5min mark.
-    const callsBefore = fetchMock.mock.calls.length;
+    const callsBefore = pulseCalls();
     vi.advanceTimersByTime(300_000); // +5min — should NOT fire if backed off
     await tick();
     // The backed-off interval is longer, so no new call at the original cadence
-    expect(fetchMock.mock.calls.length).toBe(callsBefore);
+    expect(pulseCalls()).toBe(callsBefore);
   });
 
   it("increases interval exponentially on repeated failures", async () => {
@@ -235,19 +237,19 @@ describe("lifecycle — pulse backoff on failure", () => {
     vi.advanceTimersByTime(300_000);
     await tick(); // fc=3
 
-    const callsAfter3 = fetchMock.mock.calls.length;
+    const callsAfter3 = pulseCalls();
     expect(callsAfter3).toBe(3);
 
     // Now backed off to 10min. Advance 10min — should get 1 more call
     vi.advanceTimersByTime(600_000);
     await tick();
-    const callsAfterBackoff1 = fetchMock.mock.calls.length;
+    const callsAfterBackoff1 = pulseCalls();
     expect(callsAfterBackoff1).toBe(callsAfter3 + 1); // failure #4
 
     // Now backed off to 20min. Advance 20min — should get 1 more call
     vi.advanceTimersByTime(1_200_000);
     await tick();
-    const callsAfterBackoff2 = fetchMock.mock.calls.length;
+    const callsAfterBackoff2 = pulseCalls();
     expect(callsAfterBackoff2).toBe(callsAfterBackoff1 + 1); // failure #5
   });
 
@@ -264,7 +266,7 @@ describe("lifecycle — pulse backoff on failure", () => {
     registerLifecycleHandlers(api, { apiKey: "test", pulseIntervalMs: 300_000 });
     await tick(); // initial pulse (fail 1)
 
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(pulseCalls()).toBe(1);
 
     // +5min → fail 2
     vi.advanceTimersByTime(300_000);
@@ -272,18 +274,18 @@ describe("lifecycle — pulse backoff on failure", () => {
     // +5min → fail 3 (triggers backoff)
     vi.advanceTimersByTime(300_000);
     await tick();
-    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(pulseCalls()).toBe(3);
 
     // Now interval is 10min. Advance 10min → success!
     vi.advanceTimersByTime(600_000);
     await tick();
-    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(pulseCalls()).toBe(4);
 
     // After success, interval should reset to 5min.
     // Advance 5min — should get another call at the normal cadence
     vi.advanceTimersByTime(300_000);
     await tick();
-    expect(fetchMock).toHaveBeenCalledTimes(5);
+    expect(pulseCalls()).toBe(5);
   });
 
   it("caps backoff at 60min max", async () => {
@@ -302,13 +304,13 @@ describe("lifecycle — pulse backoff on failure", () => {
     vi.advanceTimersByTime(1_200_000); await tick(); // (5) fc=5, next=40min
     // failure 6 at 40min → 60min backoff (capped)
     vi.advanceTimersByTime(2_400_000); await tick(); // (6) fc=6, next=60min
-    const callsAtCap = fetchMock.mock.calls.length;
+    const callsAtCap = pulseCalls();
     expect(callsAtCap).toBe(6);
 
     // failure 7 should be at 60min (not 80min) — cap is 60min
     vi.advanceTimersByTime(3_600_000);
     await tick();
-    expect(fetchMock.mock.calls.length).toBe(callsAtCap + 1);
+    expect(pulseCalls()).toBe(callsAtCap + 1);
   });
 });
 
