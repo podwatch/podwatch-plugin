@@ -169,8 +169,8 @@ export interface UpdateCheckResult {
   available: boolean;
   remoteVersion: string;
   source: "npm" | "dashboard";
-  /** SHA-256 hash of the expected tarball (from server). Undefined if not provided. */
-  sha256?: string;
+  /** SRI integrity hash (e.g. "sha512-<base64>") from npm registry or dashboard. */
+  integrityHash?: string;
 }
 
 /**
@@ -187,14 +187,19 @@ export async function checkForUpdate(
       signal: AbortSignal.timeout(CHECK_TIMEOUT_MS),
     });
     if (resp.ok) {
-      const data = (await resp.json()) as { version?: string; sha256?: string };
+      const data = (await resp.json()) as {
+        version?: string;
+        dist?: { integrity?: string; shasum?: string };
+      };
       if (typeof data.version === "string" && data.version) {
         const cmp = compareVersions(currentVersion, data.version);
+        // npm registry provides integrity as SRI string at dist.integrity
+        const integrity = typeof data.dist?.integrity === "string" ? data.dist.integrity : undefined;
         return {
           available: cmp > 0,
           remoteVersion: data.version,
           source: "npm",
-          sha256: typeof data.sha256 === "string" ? data.sha256 : undefined,
+          integrityHash: integrity,
         };
       }
     }
@@ -209,14 +214,17 @@ export async function checkForUpdate(
       signal: AbortSignal.timeout(CHECK_TIMEOUT_MS),
     });
     if (resp.ok) {
-      const data = (await resp.json()) as { version?: string; sha256?: string };
+      const data = (await resp.json()) as {
+        version?: string;
+        integrityHash?: string;
+      };
       if (typeof data.version === "string" && data.version) {
         const cmp = compareVersions(currentVersion, data.version);
         return {
           available: cmp > 0,
           remoteVersion: data.version,
           source: "dashboard",
-          sha256: typeof data.sha256 === "string" ? data.sha256 : undefined,
+          integrityHash: typeof data.integrityHash === "string" ? data.integrityHash : undefined,
         };
       }
     }
@@ -278,11 +286,38 @@ export interface IntegrityResult {
 }
 
 /**
- * Verify the SHA-256 hash of a tarball against an expected hash.
+ * Parse an SRI (Subresource Integrity) hash string.
+ * Format: "sha256-<base64>" or "sha512-<base64>"
+ * Returns null if the format is invalid.
+ */
+export function parseSriHash(sri: string): { algorithm: string; digest: string } | null {
+  const match = sri.match(/^(sha256|sha384|sha512)-(.+)$/);
+  if (!match) return null;
+  return { algorithm: match[1]!, digest: match[2]! };
+}
+
+/**
+ * Verify the integrity of a tarball against an expected hash.
+ * Supports:
+ * - SRI format: "sha512-<base64>" or "sha256-<base64>" (from npm registry)
+ * - Legacy hex format: plain hex SHA-256 string (from dashboard fallback)
  */
 export function verifyTarballIntegrity(tarballPath: string, expectedHash: string): IntegrityResult {
   try {
     const content = fs.readFileSync(tarballPath);
+
+    // Try SRI format first
+    const sri = parseSriHash(expectedHash);
+    if (sri) {
+      const actualDigest = crypto.createHash(sri.algorithm).update(content).digest("base64");
+      const actualSri = `${sri.algorithm}-${actualDigest}`;
+      return {
+        valid: actualDigest === sri.digest,
+        actualHash: actualSri,
+      };
+    }
+
+    // Fallback: legacy hex SHA-256 comparison
     const actualHash = crypto.createHash("sha256").update(content).digest("hex");
     return {
       valid: actualHash === expectedHash,
@@ -569,6 +604,113 @@ export interface UpdateOptions {
 }
 
 // ---------------------------------------------------------------------------
+// Urgent update trigger (called from transmitter when API signals urgent)
+// ---------------------------------------------------------------------------
+
+/** Stored references for triggering urgent updates from the transmitter. */
+let urgentUpdateState: {
+  currentVersion: string;
+  endpoint: string;
+  logger: { info: (msg: string) => void; warn: (msg: string) => void; error: (msg: string) => void };
+  options: UpdateOptions;
+} | null = null;
+
+/**
+ * Handle an urgent update signal from the Podwatch API.
+ * Bypasses the 24-hour cooldown and triggers an immediate update check.
+ * Called by the transmitter when the API response includes { update: { urgent: true } }.
+ */
+export async function handleUrgentUpdate(
+  signalVersion: string,
+  logger: { info: (msg: string) => void; warn: (msg: string) => void; error: (msg: string) => void }
+): Promise<void> {
+  if (!urgentUpdateState) {
+    logger.warn("[podwatch/updater] Urgent update signal received but updater not initialized.");
+    return;
+  }
+
+  const { currentVersion, endpoint, options } = urgentUpdateState;
+
+  // Skip if autoUpdate is disabled
+  if (options.autoUpdate === false) {
+    logger.info("[podwatch/updater] Urgent update signal received but auto-update is disabled.");
+    return;
+  }
+
+  // Skip if the signaled version is not newer
+  if (compareVersions(currentVersion, signalVersion) <= 0) {
+    logger.info(
+      `[podwatch/updater] Urgent update signal for v${signalVersion} but already at v${currentVersion}. Skipping.`
+    );
+    return;
+  }
+
+  logger.info(
+    `[podwatch/updater] Urgent update signal received for v${signalVersion}. Bypassing cooldown...`
+  );
+
+  // Run the update check immediately (bypasses shouldCheckForUpdate cooldown)
+  try {
+    const result = await checkForUpdate(currentVersion, endpoint);
+    writeCacheTimestamp();
+
+    if (!result || !result.available) {
+      logger.info("[podwatch/updater] Urgent check: no update available.");
+      return;
+    }
+
+    if (!result.integrityHash) {
+      logger.warn(
+        `[podwatch/updater] Urgent check: no integrity hash for v${result.remoteVersion}. Skipping.`
+      );
+      return;
+    }
+
+    logger.info(
+      `[podwatch/updater] Urgent update: v${currentVersion} → v${result.remoteVersion}. Downloading...`
+    );
+
+    const download = downloadTarball();
+    if (!download.success || !download.tarballPath) {
+      logger.error(`[podwatch/updater] Urgent update download failed: ${download.error}`);
+      if (download.tmpDir) {
+        try { fs.rmSync(download.tmpDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+      }
+      return;
+    }
+
+    try {
+      const integrity = verifyTarballIntegrity(download.tarballPath, result.integrityHash);
+      if (!integrity.valid) {
+        logger.error(
+          `[podwatch/updater] Urgent update integrity check failed! ` +
+            `Expected: ${result.integrityHash}, Got: ${integrity.actualHash ?? integrity.error}.`
+        );
+        return;
+      }
+
+      const installResult = installFromTarball(download.tarballPath);
+      if (!installResult.success) {
+        logger.error(`[podwatch/updater] Urgent update install failed: ${installResult.error}`);
+        return;
+      }
+
+      logger.info(
+        `[podwatch/updater] Urgent update installed (v${currentVersion} → v${result.remoteVersion}). Restarting...`
+      );
+      writeRestartSentinel(result.remoteVersion);
+      triggerGatewayRestart(logger);
+    } finally {
+      if (download.tmpDir) {
+        try { fs.rmSync(download.tmpDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+      }
+    }
+  } catch (err) {
+    logger.error(`[podwatch/updater] Urgent update error: ${err}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Main entry point (called from register())
 // ---------------------------------------------------------------------------
 
@@ -589,6 +731,9 @@ export function scheduleUpdateCheck(
   logger: { info: (msg: string) => void; warn: (msg: string) => void; error: (msg: string) => void },
   options: UpdateOptions = {}
 ): void {
+  // Store state for urgent update triggers from the transmitter
+  urgentUpdateState = { currentVersion, endpoint, logger, options };
+
   const timer = setTimeout(() => {
     void runUpdateCheck(currentVersion, endpoint, logger, options);
   }, STARTUP_DELAY_MS);
@@ -651,10 +796,10 @@ export async function runUpdateCheck(
     }
 
     // 3. Require integrity hash from server
-    if (!result.sha256) {
+    if (!result.integrityHash) {
       logger.warn(
         `[podwatch/updater] No integrity hash available for v${result.remoteVersion} (via ${result.source}). ` +
-          "Skipping update for security. The server must provide a sha256 hash."
+          "Skipping update for security. The server must provide an integrity hash."
       );
       return;
     }
@@ -683,23 +828,23 @@ export async function runUpdateCheck(
 
     try {
       // 5. Verify tarball integrity
-      const integrity = verifyTarballIntegrity(download.tarballPath, result.sha256);
+      const integrity = verifyTarballIntegrity(download.tarballPath, result.integrityHash);
 
       logger.info(
-        `[podwatch/updater] Package sha256: ${integrity.actualHash ?? "unknown"}`
+        `[podwatch/updater] Package integrity: ${integrity.actualHash ?? "unknown"}`
       );
 
       if (!integrity.valid) {
         logger.error(
           `[podwatch/updater] Tarball integrity check failed! ` +
-            `Expected: ${result.sha256}, Got: ${integrity.actualHash ?? integrity.error}. ` +
+            `Expected: ${result.integrityHash}, Got: ${integrity.actualHash ?? integrity.error}. ` +
             "Update aborted — possible supply chain attack."
         );
         return;
       }
 
       logger.info(
-        `[podwatch/updater] Integrity verified (sha256: ${integrity.actualHash}). Installing v${result.remoteVersion}...`
+        `[podwatch/updater] Integrity verified (${integrity.actualHash}). Installing v${result.remoteVersion}...`
       );
 
       // 6. Extract and install

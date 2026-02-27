@@ -14,6 +14,7 @@
  */
 
 import type { TransmitterConfig, PodwatchEvent } from "./types.js";
+import { handleUrgentUpdate } from "./updater.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
@@ -397,21 +398,33 @@ async function sendBatch(events: PodwatchEvent[]): Promise<boolean> {
     if (response.ok) {
       retryBackoffMs = 1_000;
 
-      // Parse hardStop/budgetExceeded from ingestion response to update budget immediately
+      // Parse response body for budget state + urgent update signals
       try {
         const body = (await response.json()) as {
           hardStop?: boolean;
           budgetExceeded?: boolean;
+          update?: { version?: string; urgent?: boolean };
         };
+
+        // Budget state updates
         if (cachedBudget && (body.hardStop != null || body.budgetExceeded != null)) {
           if (typeof body.hardStop === "boolean") {
             cachedBudget.hardStopActive = body.hardStop;
           }
           if (typeof body.budgetExceeded === "boolean" && body.budgetExceeded) {
-            // If the server says budget is exceeded, update the cached state
             cachedBudget.currentSpend = cachedBudget.limit;
             cachedBudget.dailySpend = cachedBudget.dailyLimit;
           }
+        }
+
+        // Urgent update signal — bypass 24h cooldown
+        if (body.update?.urgent && typeof body.update.version === "string") {
+          const logger = {
+            info: (msg: string) => console.log(msg),
+            warn: (msg: string) => console.warn(msg),
+            error: (msg: string) => console.error(msg),
+          };
+          void handleUrgentUpdate(body.update.version, logger);
         }
       } catch {
         // Response may not be JSON — that's fine
