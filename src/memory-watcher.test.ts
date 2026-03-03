@@ -284,7 +284,7 @@ describe("buildSnapshot", () => {
     expect(snap.filePath).toBe("SOUL.md");
     expect(snap.changeType).toBe("create");
     expect(snap.content).toBe("Hello world\nLine 2\n");
-    expect(snap.diff).toBe("");
+    expect(snap.diff).toContain("+Hello world");
     expect(snap.sizeBytes).toBe(Buffer.byteLength("Hello world\nLine 2\n"));
     expect(snap.lineCount).toBe(2);
     expect(snap.linesAdded).toBe(2);

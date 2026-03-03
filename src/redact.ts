@@ -31,8 +31,6 @@ const SENSITIVE_KEYS = new Set([
   "clientsecret",
   "bearer",
   "cookie",
-  "session_id",
-  "sessionid",
   "passphrase",
 
   // Encryption / signing

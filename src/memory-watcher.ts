@@ -439,13 +439,16 @@ export function buildSnapshot(
     };
   }
 
-  // Create
+  // Create — generate a full-add diff so the UI can display it
   if (oldContent === null) {
     const lineCount = newContent.split("\n").filter((l) => l !== "").length;
+    const lines = newContent.split("\n");
+    const createDiff = `--- /dev/null\n+++ ${filePath}\n@@ -0,0 +1,${lines.length} @@\n${lines.map((l) => `+${l}`).join("\n")}`;
+    const clampedDiff = createDiff.length > MAX_DIFF_SIZE ? createDiff.slice(0, MAX_DIFF_SIZE) + "\n[diff truncated]" : createDiff;
     return {
       filePath,
       changeType: "create",
-      diff: "",
+      diff: clampedDiff,
       content: newContent,
       sizeBytes: Buffer.byteLength(newContent, "utf-8"),
       lineCount,

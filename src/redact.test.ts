@@ -29,7 +29,7 @@ describe("key-based redaction", () => {
     "password", "secret", "token", "apiKey", "api_key", "authorization",
     "credentials", "private_key", "privateKey", "access_token", "accessToken",
     "refresh_token", "refreshToken", "client_secret", "clientSecret", "bearer",
-    "cookie", "session_id", "sessionId", "passphrase",
+    "cookie", "passphrase",
     // New — encryption / signing
     "encryption_key", "encryptionKey", "signing_key", "signingKey",
     "master_key", "masterKey",
