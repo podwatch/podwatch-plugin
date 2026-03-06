@@ -20,6 +20,7 @@ import { registerBudgetHooks } from "./hooks/budget.js";
 import { transmitter } from "./transmitter.js";
 import { scheduleUpdateCheck } from "./updater.js";
 import { startMemoryWatcher } from "./memory-watcher.js";
+import { recordActivity } from "./activity-tracker.js";
 
 // ---------------------------------------------------------------------------
 // Plugin config interface
@@ -122,6 +123,13 @@ export default function register(api: PluginApi): void {
   registerSessionHandlers(api);
   registerLifecycleHandlers(api, config);
   registerBudgetHooks(api, config);
+
+  // Track agent activity for graceful restart deferral.
+  // These lightweight calls update a singleton timestamp — no I/O, no throwing.
+  api.on("before_agent_start", () => { recordActivity(); });
+  api.on("before_tool_call", () => { recordActivity(); });
+  api.on("message_received", () => { recordActivity(); });
+  api.on("session_start", () => { recordActivity(); });
 
   // Schedule non-blocking auto-update check (30s after boot, 24h cooldown)
   // Auto-update is opt-in (default false) for supply chain security.

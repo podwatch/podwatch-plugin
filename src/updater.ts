@@ -21,6 +21,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { isInactive } from "./activity-tracker.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -32,6 +33,11 @@ const NPM_PACK_TIMEOUT_MS = 120_000;
 const SPAWN_TIMEOUT_MS = 15_000;
 const STARTUP_DELAY_MS = 30_000;
 const COOLDOWN_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+// Graceful restart: wait for idle window before restarting
+const IDLE_THRESHOLD_MS = 15 * 60 * 1000; // 15 minutes of inactivity
+const DEFER_INTERVAL_MS = 5 * 60 * 1000;  // Re-check every 5 minutes
+const MAX_DEFER_MS = 2 * 60 * 60 * 1000;  // Max 2 hours of deferral
 
 const CACHE_DIR = path.join(
   process.env.HOME ?? process.env.USERPROFILE ?? "/tmp",
@@ -488,6 +494,51 @@ export function executeUpdate(): UpdateResult {
 }
 
 // ---------------------------------------------------------------------------
+// Graceful idle window — defer restart until agent is inactive
+// ---------------------------------------------------------------------------
+
+/**
+ * Wait for an idle window before proceeding with a gateway restart.
+ *
+ * Checks isInactive(15min). If the agent is active, defers 5 minutes and
+ * re-checks. After a maximum of 2 hours of deferral, forces the restart
+ * with a warning log.
+ *
+ * @returns true if idle window was found, false if forced after max deferral
+ */
+export async function waitForIdleWindow(
+  logger: { info: (msg: string) => void; warn: (msg: string) => void; error: (msg: string) => void }
+): Promise<boolean> {
+  let totalDeferred = 0;
+
+  while (!isInactive(IDLE_THRESHOLD_MS)) {
+    if (totalDeferred >= MAX_DEFER_MS) {
+      logger.warn(
+        `[podwatch/updater] Agent still active after ${Math.round(MAX_DEFER_MS / 60_000)}min of deferral. Forcing restart.`
+      );
+      return false;
+    }
+
+    logger.info(
+      `[podwatch/updater] Agent is active — deferring restart for ${DEFER_INTERVAL_MS / 60_000}min ` +
+        `(deferred ${Math.round(totalDeferred / 60_000)}/${Math.round(MAX_DEFER_MS / 60_000)}min so far).`
+    );
+
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, DEFER_INTERVAL_MS);
+      if (timer && typeof timer === "object" && "unref" in timer) {
+        timer.unref();
+      }
+    });
+
+    totalDeferred += DEFER_INTERVAL_MS;
+  }
+
+  logger.info("[podwatch/updater] Agent is idle — proceeding with restart.");
+  return true;
+}
+
+// ---------------------------------------------------------------------------
 // Gateway restart via OS service manager
 // ---------------------------------------------------------------------------
 
@@ -696,8 +747,9 @@ export async function handleUrgentUpdate(
       }
 
       logger.info(
-        `[podwatch/updater] Urgent update installed (v${currentVersion} → v${result.remoteVersion}). Restarting...`
+        `[podwatch/updater] Urgent update installed (v${currentVersion} → v${result.remoteVersion}). Waiting for idle window before restart...`
       );
+      await waitForIdleWindow(logger);
       writeRestartSentinel(result.remoteVersion);
       triggerGatewayRestart(logger);
     } finally {
@@ -861,13 +913,16 @@ export async function runUpdateCheck(
       }
 
       logger.info(
-        `[podwatch/updater] Update installed successfully (v${currentVersion} → v${result.remoteVersion}). Writing sentinel and triggering restart...`
+        `[podwatch/updater] Update installed successfully (v${currentVersion} → v${result.remoteVersion}). Waiting for idle window before restart...`
       );
 
-      // 7. Write restart sentinel so the gateway knows why it restarted
+      // 7. Wait for idle window (defer if agent is active)
+      await waitForIdleWindow(logger);
+
+      // 8. Write restart sentinel so the gateway knows why it restarted
       writeRestartSentinel(result.remoteVersion);
 
-      // 8. Trigger restart via OS service manager
+      // 9. Trigger restart via OS service manager
       triggerGatewayRestart(logger);
     } finally {
       // Cleanup temp dir
