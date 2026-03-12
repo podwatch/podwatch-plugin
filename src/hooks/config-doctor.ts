@@ -611,7 +611,7 @@ export function computeHealthScore(checks: HealthCheck[]): number {
 /**
  * Run all health checks and return the result.
  */
-export function runAllChecks(stateDir?: string, now?: number): ConfigHealthResult {
+export function runAllChecks(stateDir?: string, now?: number): ConfigHealthResult & { rawConfig?: OpenClawConfig | null } {
   const config = readOpenClawConfig(stateDir);
 
   // If we can't read the config, that's a critical failure
@@ -625,6 +625,7 @@ export function runAllChecks(stateDir?: string, now?: number): ConfigHealthResul
         detail: "Config file not found or invalid JSON",
       }],
       checkedAt: new Date().toISOString(),
+      rawConfig: null,
     };
   }
 
@@ -643,6 +644,7 @@ export function runAllChecks(stateDir?: string, now?: number): ConfigHealthResul
     score: computeHealthScore(checks),
     checks,
     checkedAt: new Date().toISOString(),
+    rawConfig: config,
   };
 }
 
@@ -652,7 +654,7 @@ export function runAllChecks(stateDir?: string, now?: number): ConfigHealthResul
  */
 export function checkConfigHealth(stateDir?: string, now?: number): ConfigHealthResult {
   try {
-    const result = runAllChecks(stateDir, now);
+    const { rawConfig, ...result } = runAllChecks(stateDir, now);
     const currentTime = now ?? Date.now();
 
     // Change detection — only send if score/checks changed or it's been > 1 hour
@@ -663,7 +665,7 @@ export function checkConfigHealth(stateDir?: string, now?: number): ConfigHealth
     if (shouldSend) {
       lastSnapshot = snapshot;
       lastSendTime = currentTime;
-      void sendConfigHealthToApi(result);
+      void sendConfigHealthToApi(result, rawConfig);
     }
 
     return result;
@@ -686,27 +688,81 @@ export function checkConfigHealth(stateDir?: string, now?: number): ConfigHealth
 }
 
 // ---------------------------------------------------------------------------
+// Config sanitization
+// ---------------------------------------------------------------------------
+
+/** Keys whose values must be redacted (case-insensitive substring match). */
+const SENSITIVE_KEY_PATTERNS = [
+  "token", "secret", "password", "apikey", "api_key", "credential",
+  "private", "auth_token", "bottoken", "bot_token", "webhook",
+];
+
+function isSensitiveKey(key: string): boolean {
+  const lower = key.toLowerCase();
+  return SENSITIVE_KEY_PATTERNS.some((p) => lower.includes(p));
+}
+
+/**
+ * Deep-clone a config object, replacing sensitive values with "[REDACTED]".
+ * Preserves structure so the server can analyze keys, nesting, and non-secret values.
+ */
+export function sanitizeConfig(obj: unknown, depth = 0): unknown {
+  if (depth > 10) return "[MAX_DEPTH]";
+  if (obj === null || obj === undefined) return obj;
+  if (typeof obj === "boolean" || typeof obj === "number") return obj;
+  if (typeof obj === "string") return obj;
+
+  if (Array.isArray(obj)) {
+    return obj.map((item) => sanitizeConfig(item, depth + 1));
+  }
+
+  if (typeof obj === "object") {
+    const result: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
+      if (isSensitiveKey(key)) {
+        result[key] = "[REDACTED]";
+      } else if (typeof value === "string" && (value.startsWith("pw_") || value.startsWith("sk-") || value.startsWith("gsk_") || value.match(/^[a-f0-9]{32,}$/i))) {
+        // Looks like a raw secret value even if key isn't flagged
+        result[key] = "[REDACTED]";
+      } else {
+        result[key] = sanitizeConfig(value, depth + 1);
+      }
+    }
+    return result;
+  }
+
+  return String(obj);
+}
+
+// ---------------------------------------------------------------------------
 // API communication
 // ---------------------------------------------------------------------------
 
 /**
- * Send config health data to the Podwatch API.
+ * Send config health data + sanitized config snapshot to the Podwatch API.
  */
-async function sendConfigHealthToApi(result: ConfigHealthResult): Promise<void> {
+async function sendConfigHealthToApi(result: ConfigHealthResult, rawConfig?: OpenClawConfig | null): Promise<void> {
   if (!configuredEndpoint || !configuredApiKey) return;
 
   try {
+    const payload: Record<string, unknown> = {
+      score: result.score,
+      checks: result.checks,
+      checkedAt: result.checkedAt,
+    };
+
+    // Include sanitized config so server can derive its own checks
+    if (rawConfig) {
+      payload.configSnapshot = sanitizeConfig(rawConfig);
+    }
+
     const response = await fetch(`${configuredEndpoint}/config-health`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${configuredApiKey}`,
       },
-      body: JSON.stringify({
-        score: result.score,
-        checks: result.checks,
-        checkedAt: result.checkedAt,
-      }),
+      body: JSON.stringify(payload),
       signal: AbortSignal.timeout(10_000),
     });
 
