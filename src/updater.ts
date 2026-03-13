@@ -112,6 +112,26 @@ export function normalizeSystemdUnit(raw: string | undefined, profile: string | 
  * Compare two semver-like version strings.
  * Returns positive if remote > local, negative if local > remote, 0 if equal.
  */
+/**
+ * Read the installed plugin version from disk (extensions dir package.json).
+ * Returns null if the file can't be read.
+ */
+export function getInstalledVersion(): string | null {
+  try {
+    const extensionsDir = path.join(
+      process.env.HOME ?? process.env.USERPROFILE ?? "/tmp",
+      ".openclaw",
+      "extensions",
+      "podwatch"
+    );
+    const pkgPath = path.join(extensionsDir, "package.json");
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+    return typeof pkg.version === "string" ? pkg.version : null;
+  } catch {
+    return null;
+  }
+}
+
 export function compareVersions(local: string, remote: string): number {
   const parse = (v: string) =>
     v
@@ -354,6 +374,11 @@ export interface UpdateResult {
  * Download the latest podwatch tarball via npm pack.
  * Returns the tarball path on success for integrity verification.
  */
+/**
+ * Download the podwatch tarball via `npx npm pack`.
+ * Uses npx instead of npm directly — npx is guaranteed to be in PATH
+ * since OpenClaw loads the plugin through it.
+ */
 export function downloadTarball(): UpdateResult & { tmpDir?: string } {
   let tmpDir: string | null = null;
 
@@ -361,8 +386,8 @@ export function downloadTarball(): UpdateResult & { tmpDir?: string } {
     // 1. Create temp dir for npm pack
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "podwatch-update-"));
 
-    // 2. npm pack podwatch (downloads latest from registry)
-    const packResult = spawnSync("npm", ["pack", "podwatch", "--pack-destination", tmpDir], {
+    // 2. npx npm pack podwatch (npx is always available since the plugin runs via it)
+    const packResult = spawnSync("npx", ["-y", "npm", "pack", "podwatch", "--pack-destination", tmpDir], {
       encoding: "utf8",
       timeout: NPM_PACK_TIMEOUT_MS,
       cwd: tmpDir,
@@ -373,7 +398,7 @@ export function downloadTarball(): UpdateResult & { tmpDir?: string } {
         success: false,
         stdout: packResult.stdout,
         stderr: packResult.stderr,
-        error: packResult.error?.message ?? `npm pack exited with status ${packResult.status}`,
+        error: packResult.error?.message ?? `npx npm pack exited with status ${packResult.status}`,
         tmpDir,
       };
     }
@@ -680,13 +705,16 @@ export async function handleUrgentUpdate(
     return;
   }
 
-  const { currentVersion, endpoint, options } = urgentUpdateState;
+  const { currentVersion: startupVersion, endpoint, options } = urgentUpdateState;
 
   // Skip if autoUpdate is disabled
   if (options.autoUpdate === false) {
     logger.info("[podwatch/updater] Urgent update signal received but auto-update is disabled.");
     return;
   }
+
+  // Read version from disk — startup version may be stale if plugin updated without restart
+  const currentVersion = getInstalledVersion() ?? startupVersion;
 
   // Skip if the signaled version is not newer
   if (compareVersions(currentVersion, signalVersion) <= 0) {

@@ -335,8 +335,8 @@ describe("executeUpdate", () => {
     const result = executeUpdate();
     expect(result.success).toBe(true);
     expect(mockSpawnSync).toHaveBeenCalledWith(
-      "npm",
-      ["pack", "podwatch", "--pack-destination", "/tmp/podwatch-update-abc123"],
+      "npx",
+      ["-y", "npm", "pack", "podwatch", "--pack-destination", "/tmp/podwatch-update-abc123"],
       expect.objectContaining({ timeout: 120_000 })
     );
     expect(mockSpawnSync).toHaveBeenCalledWith(
@@ -1375,6 +1375,9 @@ describe("handleUrgentUpdate", () => {
       version: "1.2.0",
       dist: { integrity: sriHash },
     }));
+
+    // getInstalledVersion reads package.json from disk — return current (old) version
+    mockReadFileSync.mockReturnValueOnce(JSON.stringify({ version: "1.0.0" }));
 
     // npm pack + tar extract + systemctl restart
     mockMkdtempSync.mockReturnValue("/tmp/podwatch-urgent-abc");
