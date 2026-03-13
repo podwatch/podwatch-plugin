@@ -20,7 +20,7 @@
     "clean": "rm -rf dist",
     "test": "vitest run",
     "test:watch": "vitest",
-    "prepublishOnly": "npm run test && npm run build"
+    "prepublishOnly": "node scripts/sync-version.js && npm run test && npm run build"
   },
   "engines": {
     "node": ">=16.0.0"
