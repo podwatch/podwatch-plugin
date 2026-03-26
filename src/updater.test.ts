@@ -63,6 +63,21 @@ vi.mock("node:os", () => ({
   homedir: () => "/home/testuser",
 }));
 
+// Mock transmitter
+const mockEnqueue = vi.fn();
+const mockFlush = vi.fn().mockResolvedValue(undefined);
+vi.mock("./transmitter.js", () => ({
+  transmitter: {
+    enqueue: (...args: unknown[]) => mockEnqueue(...args),
+    flush: (...args: unknown[]) => mockFlush(...args),
+  },
+}));
+
+// Mock activity-tracker
+vi.mock("./activity-tracker.js", () => ({
+  isInactive: () => true, // Always idle in tests
+}));
+
 // Mock global fetch (Bun doesn't have vi.stubGlobal)
 const mockFetch = vi.fn();
 globalThis.fetch = mockFetch as any;
@@ -719,7 +734,7 @@ describe("runUpdateCheck — integrity verification", () => {
     );
   });
 
-  it("writes restart sentinel but does NOT trigger gateway restart", async () => {
+  it("verifies new dist, writes sentinel, and triggers graceful restart", async () => {
     const logger = mockLogger();
     const crypto = require("node:crypto");
     const tarballContent = Buffer.from("update content");
@@ -734,30 +749,47 @@ describe("runUpdateCheck — integrity verification", () => {
 
     mockMkdtempSync.mockReturnValue("/tmp/podwatch-update-abc");
 
-    // tar extract succeeds
-    mockSpawnSync.mockReturnValueOnce({ error: null, status: 0, stdout: "", stderr: "" });
+    // existsSync: return true for everything (dist/, dist/index.js, backup, etc.)
+    mockExistsSync.mockReturnValue(true);
 
-    // Mock reading tarball for hash verification
-    mockReadFileSync.mockReturnValueOnce(tarballContent);
+    // spawnSync calls in order:
+    // 1. installFromTarball → tar extract succeeds
+    // 2. verifyNewDist → child process check succeeds
+    // 3. triggerGatewayRestart → systemctl --user restart succeeds
+    mockSpawnSync
+      .mockReturnValueOnce({ error: null, status: 0, stdout: "", stderr: "" })  // tar
+      .mockReturnValueOnce({ error: null, status: 0, stdout: "", stderr: "" })  // verifyNewDist
+      .mockReturnValueOnce({ error: null, status: 0, stdout: "", stderr: "" }); // systemctl
+
+    // readFileSync calls in order:
+    // 1. shouldCheckForUpdate → read cache file (throw = no cache = should check)
+    // 2. verifyTarballIntegrity → read tarball for hash
+    mockReadFileSync
+      .mockImplementationOnce(() => { throw new Error("ENOENT"); })
+      .mockReturnValueOnce(tarballContent);
 
     await runUpdateCheck("1.0.0", "https://podwatch.app/api", logger, { autoUpdate: true });
 
-    // Should have written sentinel
-    expect(mockWriteFileSync).toHaveBeenCalledWith(
-      expect.stringContaining("restart-sentinel.json"),
-      expect.any(String),
-      "utf-8"
+    // Should have written sentinel (among other writeFileSync calls like cache timestamp)
+    const sentinelCall = mockWriteFileSync.mock.calls.find(
+      (call: unknown[]) => typeof call[0] === "string" && (call[0] as string).includes("restart-sentinel.json")
     );
+    expect(sentinelCall).toBeTruthy();
 
-    // Should NOT have called systemctl or launchctl (no gateway restart)
+    // Should have triggered restart (systemctl call)
     const restartCalls = mockSpawnSync.mock.calls.filter(
       (call: unknown[]) => call[0] === "systemctl" || call[0] === "launchctl"
     );
-    expect(restartCalls).toHaveLength(0);
+    expect(restartCalls.length).toBeGreaterThanOrEqual(1);
 
-    // Should log that restart sentinel was written
+    // Should have sent dashboard notification
+    expect(mockEnqueue).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "alert", severity: "info" })
+    );
+
+    // Should log success
     expect(logger.info).toHaveBeenCalledWith(
-      expect.stringContaining("Restart sentinel written")
+      expect.stringContaining("verified and installed")
     );
   });
 });

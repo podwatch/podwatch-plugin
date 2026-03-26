@@ -19,6 +19,7 @@
 
 import { spawnSync } from "node:child_process";
 import { transmitter } from "./transmitter.js";
+import { isInactive } from "./activity-tracker.js";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -32,8 +33,14 @@ const NPM_REGISTRY_URL = "https://registry.npmjs.org/podwatch/latest";
 const NPM_TARBALL_URL_PREFIX = "https://registry.npmjs.org/podwatch/-/podwatch-";
 const CHECK_TIMEOUT_MS = 5_000;
 const DOWNLOAD_TIMEOUT_MS = 60_000;
+const SPAWN_TIMEOUT_MS = 15_000;
 const STARTUP_DELAY_MS = 30_000;
 const COOLDOWN_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+// Graceful restart: wait for idle window before restarting
+const IDLE_THRESHOLD_MS = 15 * 60 * 1000; // 15 minutes of inactivity
+const DEFER_INTERVAL_MS = 5 * 60 * 1000;  // Re-check every 5 minutes
+const MAX_DEFER_MS = 2 * 60 * 60 * 1000;  // Max 2 hours of deferral
 
 const CACHE_DIR = path.join(
   process.env.HOME ?? process.env.USERPROFILE ?? "/tmp",
@@ -564,6 +571,178 @@ export function executeUpdate(): UpdateResult {
 }
 
 // ---------------------------------------------------------------------------
+// Pre-restart verification
+// ---------------------------------------------------------------------------
+
+/**
+ * Verify that the newly installed dist/index.js is loadable.
+ * Tries to require() the entry point — if it throws, the new code is broken.
+ * Returns true if the module loads successfully, false otherwise.
+ */
+export function verifyNewDist(extensionsDir: string): boolean {
+  const entryPoint = path.join(extensionsDir, "dist", "index.js");
+  try {
+    if (!fs.existsSync(entryPoint)) return false;
+    // Use a child process to verify — don't pollute our own module cache
+    const result = spawnSync(
+      process.execPath,
+      ["-e", `try { require(${JSON.stringify(entryPoint)}); process.exit(0); } catch(e) { console.error(e.message); process.exit(1); }`],
+      { encoding: "utf8", timeout: 10_000 }
+    );
+    return result.status === 0;
+  } catch {
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Graceful idle window — defer restart until agent is inactive
+// ---------------------------------------------------------------------------
+
+/**
+ * Wait for an idle window before proceeding with a gateway restart.
+ *
+ * Checks isInactive(15min). If the agent is active, defers 5 minutes and
+ * re-checks. After a maximum of 2 hours of deferral, forces the restart
+ * with a warning log.
+ *
+ * @returns true if idle window was found, false if forced after max deferral
+ */
+export async function waitForIdleWindow(
+  logger: { info: (msg: string) => void; warn: (msg: string) => void; error: (msg: string) => void }
+): Promise<boolean> {
+  let totalDeferred = 0;
+
+  while (!isInactive(IDLE_THRESHOLD_MS)) {
+    if (totalDeferred >= MAX_DEFER_MS) {
+      logger.warn(
+        `[podwatch/updater] Agent still active after ${Math.round(MAX_DEFER_MS / 60_000)}min of deferral. Forcing restart.`
+      );
+      return false;
+    }
+
+    logger.info(
+      `[podwatch/updater] Agent is active — deferring restart for ${DEFER_INTERVAL_MS / 60_000}min ` +
+        `(deferred ${Math.round(totalDeferred / 60_000)}/${Math.round(MAX_DEFER_MS / 60_000)}min so far).`
+    );
+
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, DEFER_INTERVAL_MS);
+      if (timer && typeof timer === "object" && "unref" in timer) {
+        timer.unref();
+      }
+    });
+
+    totalDeferred += DEFER_INTERVAL_MS;
+  }
+
+  logger.info("[podwatch/updater] Agent is idle — proceeding with restart.");
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Gateway restart via OS service manager (with safety checks)
+// ---------------------------------------------------------------------------
+
+export interface RestartResult {
+  ok: boolean;
+  method: string;
+  detail?: string;
+  tried: string[];
+}
+
+/**
+ * Resolve the systemd service name for the gateway.
+ */
+function resolveGatewayServiceName(profile: string | undefined): string {
+  const trimmed = profile?.trim();
+  const normalized = (!trimmed || trimmed.toLowerCase() === "default") ? null : trimmed;
+  const suffix = normalized ? `-${normalized}` : "";
+  return `openclaw-gateway${suffix}.service`;
+}
+
+/**
+ * Trigger a gateway restart using the OS service manager.
+ *
+ * Safety improvements over original:
+ * - Only called AFTER verifyNewDist() confirms the new code loads
+ * - Only called AFTER integrity verification passed
+ * - Only called AFTER rollback backup is in place
+ * - Single attempt — if restart fails, logs error and moves on (no retry loop)
+ *
+ * Linux: systemctl --user restart <unit>
+ * macOS: launchctl kickstart -k gui/<uid>/<label>
+ */
+export function triggerGatewayRestart(
+  logger: { info: (msg: string) => void; warn: (msg: string) => void; error: (msg: string) => void }
+): RestartResult {
+  const tried: string[] = [];
+
+  if (process.platform === "linux") {
+    const unit = resolveGatewayServiceName(process.env.OPENCLAW_PROFILE);
+
+    // Try user-level systemctl
+    const args = ["--user", "restart", unit];
+    tried.push(`systemctl ${args.join(" ")}`);
+    const result = spawnSync("systemctl", args, {
+      encoding: "utf8",
+      timeout: SPAWN_TIMEOUT_MS,
+    });
+
+    if (!result.error && result.status === 0) {
+      logger.info("[podwatch/updater] Gateway restarted via systemctl --user.");
+      return { ok: true, method: "systemd", tried };
+    }
+
+    // Single fallback: system-level
+    const sysArgs = ["restart", unit];
+    tried.push(`systemctl ${sysArgs.join(" ")}`);
+    const sysResult = spawnSync("systemctl", sysArgs, {
+      encoding: "utf8",
+      timeout: SPAWN_TIMEOUT_MS,
+    });
+
+    if (!sysResult.error && sysResult.status === 0) {
+      logger.info("[podwatch/updater] Gateway restarted via systemctl (system).");
+      return { ok: true, method: "systemd", tried };
+    }
+
+    const detail = `user: ${result.error?.message ?? `exit ${result.status}`}; system: ${sysResult.error?.message ?? `exit ${sysResult.status}`}`;
+    logger.warn(`[podwatch/updater] Could not restart gateway: ${detail}. Restart manually to activate update.`);
+    return { ok: false, method: "systemd", detail, tried };
+  }
+
+  if (process.platform === "darwin") {
+    const profile = process.env.OPENCLAW_PROFILE?.trim();
+    const normalized = (!profile || profile.toLowerCase() === "default") ? null : profile;
+    const label = process.env.OPENCLAW_LAUNCHD_LABEL || (normalized ? `ai.openclaw.${normalized}` : "ai.openclaw.gateway");
+    const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+    const target = uid !== undefined ? `gui/${uid}/${label}` : label;
+    const args = ["kickstart", "-k", target];
+    tried.push(`launchctl ${args.join(" ")}`);
+
+    const res = spawnSync("launchctl", args, {
+      encoding: "utf8",
+      timeout: SPAWN_TIMEOUT_MS,
+    });
+
+    if (!res.error && res.status === 0) {
+      logger.info("[podwatch/updater] Gateway restarted via launchctl.");
+      return { ok: true, method: "launchctl", tried };
+    }
+
+    const detail = res.error?.message ?? `exit ${res.status}`;
+    logger.warn(`[podwatch/updater] Could not restart gateway: ${detail}. Restart manually to activate update.`);
+    return { ok: false, method: "launchctl", detail, tried };
+  }
+
+  logger.info(
+    `[podwatch/updater] Platform "${process.platform}" — restart manually to activate update.`
+  );
+  return { ok: false, method: "unsupported", detail: `platform: ${process.platform}`, tried };
+}
+
+// ---------------------------------------------------------------------------
 // Update options
 // ---------------------------------------------------------------------------
 
@@ -716,21 +895,61 @@ export async function runUpdateCheck(
         return;
       }
 
-      // 7. Write restart sentinel (gateway picks it up on next natural restart)
+      // 7. Verify the new dist loads before doing anything dangerous
+      const extensionsDir = path.join(
+        process.env.HOME ?? process.env.USERPROFILE ?? "/tmp",
+        ".openclaw", "extensions", "podwatch"
+      );
+      const distOk = verifyNewDist(extensionsDir);
+
+      if (!distOk) {
+        logger.error(
+          `[podwatch/updater] New dist/index.js failed to load! Rolling back to previous version.`
+        );
+        // installFromTarball has its own rollback, but if it succeeded and the JS is still broken:
+        const backupDir = path.join(extensionsDir, "dist.backup");
+        if (fs.existsSync(backupDir)) {
+          restoreFromBackup(extensionsDir, backupDir);
+          logger.info("[podwatch/updater] Rolled back to previous version.");
+        }
+        transmitter.enqueue({
+          type: "alert",
+          ts: Date.now(),
+          message: `Podwatch update to v${result.remoteVersion} failed verification — rolled back. Please report this.`,
+          severity: "error",
+        });
+        return;
+      }
+
+      // 8. Write restart sentinel
       writeRestartSentinel(result.remoteVersion);
 
-      // 8. Notify dashboard so user sees the update
+      // 9. Notify dashboard
       transmitter.enqueue({
         type: "alert",
         ts: Date.now(),
-        message: `Podwatch updated: v${currentVersion} → v${result.remoteVersion}. Restart gateway to activate.`,
+        message: `Podwatch updated: v${currentVersion} → v${result.remoteVersion}. Restarting gateway...`,
         severity: "info",
       });
 
+      // 10. Flush transmitter so the notification gets out before restart
+      await transmitter.flush();
+
       logger.info(
-        `[podwatch/updater] Update installed successfully (v${currentVersion} → v${result.remoteVersion}). ` +
-          "Restart sentinel written — changes will take effect on next gateway restart."
+        `[podwatch/updater] Update verified and installed (v${currentVersion} → v${result.remoteVersion}). ` +
+          "Waiting for idle window before restart..."
       );
+
+      // 11. Wait for idle window, then restart
+      await waitForIdleWindow(logger);
+      const restartResult = triggerGatewayRestart(logger);
+
+      if (!restartResult.ok) {
+        logger.info(
+          `[podwatch/updater] Automatic restart not available. Update is installed — ` +
+            "restart the gateway manually to activate."
+        );
+      }
     } finally {
       // Cleanup temp dir
       if (download.tmpDir) {
