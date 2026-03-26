@@ -251,10 +251,13 @@ describe("transmitter", () => {
       expect(transmitter.bufferedCount).toBe(900);
     });
 
-    it("writes audit log on buffer overflow", () => {
+    it("writes audit log on buffer overflow", async () => {
       for (let i = 0; i < 1005; i++) {
         transmitter.enqueue({ type: "cost", ts: Date.now(), eventId: `evt-${i}` });
       }
+
+      // Audit log writes are now deferred via queueMicrotask — flush
+      await new Promise((r) => setTimeout(r, 10));
 
       expect(fs.appendFileSync).toHaveBeenCalled();
       const calls = (fs.appendFileSync as any).mock.calls;

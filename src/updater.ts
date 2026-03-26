@@ -3,41 +3,36 @@
  *
  * On plugin startup (called from register()), schedules a non-blocking update
  * check after a 30-second delay. If a new version is available on npm (or the
- * Podwatch dashboard fallback), it downloads via `npm pack`, extracts to the
- * extensions directory, writes a restart sentinel, and triggers a gateway
- * restart via the OS service manager (systemd / launchctl).
+ * Podwatch dashboard fallback), it downloads the tarball via fetch(), verifies
+ * integrity, extracts to the extensions directory, and writes a restart sentinel.
  *
  * Safety:
  * - 30s startup delay (don't slow boot)
  * - 24-hour cooldown between checks (cached in a local file)
  * - 5s timeout on all HTTP requests
- * - 120s timeout on npm pack command
  * - All errors caught — never bricks the running plugin
- * - Logs all activity for debugging
+ * - Rollback: backs up old dist/ before replacing, restores on extraction failure
+ * - Plugin NEVER restarts its host — only writes restart sentinel
+ * - Auto-update defaults to OFF (opt-in)
+ * - No handleUrgentUpdate — removed as remote code execution vector
  */
 
-import { execSync, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { isInactive } from "./activity-tracker.js";
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
 const NPM_REGISTRY_URL = "https://registry.npmjs.org/podwatch/latest";
+const NPM_TARBALL_URL_PREFIX = "https://registry.npmjs.org/podwatch/-/podwatch-";
 const CHECK_TIMEOUT_MS = 5_000;
-const NPM_PACK_TIMEOUT_MS = 120_000;
-const SPAWN_TIMEOUT_MS = 15_000;
+const DOWNLOAD_TIMEOUT_MS = 60_000;
 const STARTUP_DELAY_MS = 30_000;
 const COOLDOWN_MS = 24 * 60 * 60 * 1000; // 24 hours
-
-// Graceful restart: wait for idle window before restarting
-const IDLE_THRESHOLD_MS = 15 * 60 * 1000; // 15 minutes of inactivity
-const DEFER_INTERVAL_MS = 5 * 60 * 1000;  // Re-check every 5 minutes
-const MAX_DEFER_MS = 2 * 60 * 60 * 1000;  // Max 2 hours of deferral
 
 const CACHE_DIR = path.join(
   process.env.HOME ?? process.env.USERPROFILE ?? "/tmp",
@@ -64,54 +59,9 @@ export function resolveStateDir(): string {
 }
 
 // ---------------------------------------------------------------------------
-// Service name resolution (mirrors OpenClaw's constants)
-// ---------------------------------------------------------------------------
-
-/**
- * Normalize a gateway profile string. Returns null for empty/default.
- */
-function normalizeGatewayProfile(profile: string | undefined): string | null {
-  const trimmed = profile?.trim();
-  if (!trimmed || trimmed.toLowerCase() === "default") return null;
-  return trimmed;
-}
-
-/**
- * Resolve the systemd service name for the gateway.
- */
-export function resolveGatewaySystemdServiceName(profile: string | undefined): string {
-  const normalized = normalizeGatewayProfile(profile);
-  const suffix = normalized ? `-${normalized}` : "";
-  if (!suffix) return "openclaw-gateway";
-  return `openclaw-gateway${suffix}`;
-}
-
-/**
- * Resolve the launchd label for the gateway.
- */
-export function resolveGatewayLaunchAgentLabel(profile: string | undefined): string {
-  const normalized = normalizeGatewayProfile(profile);
-  if (!normalized) return "ai.openclaw.gateway";
-  return `ai.openclaw.${normalized}`;
-}
-
-/**
- * Normalize a systemd unit name. Appends .service if missing.
- */
-export function normalizeSystemdUnit(raw: string | undefined, profile: string | undefined): string {
-  const unit = raw?.trim();
-  if (!unit) return `${resolveGatewaySystemdServiceName(profile)}.service`;
-  return unit.endsWith(".service") ? unit : `${unit}.service`;
-}
-
-// ---------------------------------------------------------------------------
 // Version comparison
 // ---------------------------------------------------------------------------
 
-/**
- * Compare two semver-like version strings.
- * Returns positive if remote > local, negative if local > remote, 0 if equal.
- */
 /**
  * Read the installed plugin version from disk (extensions dir package.json).
  * Returns null if the file can't be read.
@@ -132,6 +82,10 @@ export function getInstalledVersion(): string | null {
   }
 }
 
+/**
+ * Compare two semver-like version strings.
+ * Returns positive if remote > local, negative if local > remote, 0 if equal.
+ */
 export function compareVersions(local: string, remote: string): number {
   const parse = (v: string) =>
     v
@@ -197,6 +151,8 @@ export interface UpdateCheckResult {
   source: "npm" | "dashboard";
   /** SRI integrity hash (e.g. "sha512-<base64>") from npm registry or dashboard. */
   integrityHash?: string;
+  /** Direct tarball URL from npm registry (for fetch-based download). */
+  tarballUrl?: string;
 }
 
 /**
@@ -215,17 +171,19 @@ export async function checkForUpdate(
     if (resp.ok) {
       const data = (await resp.json()) as {
         version?: string;
-        dist?: { integrity?: string; shasum?: string };
+        dist?: { integrity?: string; shasum?: string; tarball?: string };
       };
       if (typeof data.version === "string" && data.version) {
         const cmp = compareVersions(currentVersion, data.version);
         // npm registry provides integrity as SRI string at dist.integrity
         const integrity = typeof data.dist?.integrity === "string" ? data.dist.integrity : undefined;
+        const tarballUrl = typeof data.dist?.tarball === "string" ? data.dist.tarball : undefined;
         return {
           available: cmp > 0,
           remoteVersion: data.version,
           source: "npm",
           integrityHash: integrity,
+          tarballUrl,
         };
       }
     }
@@ -358,7 +316,64 @@ export function verifyTarballIntegrity(tarballPath: string, expectedHash: string
 }
 
 // ---------------------------------------------------------------------------
-// Update execution (npm pack + extract)
+// Rollback helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Back up the existing dist/ directory before replacing it.
+ * Returns the backup path, or null if no dist/ exists.
+ */
+export function backupDist(extensionsDir: string): string | null {
+  const distDir = path.join(extensionsDir, "dist");
+  if (!fs.existsSync(distDir)) return null;
+
+  const backupDir = path.join(extensionsDir, "dist.backup");
+  try {
+    // Remove stale backup if it exists
+    if (fs.existsSync(backupDir)) {
+      fs.rmSync(backupDir, { recursive: true, force: true });
+    }
+    fs.renameSync(distDir, backupDir);
+    return backupDir;
+  } catch (err) {
+    console.warn("[podwatch/updater] Failed to backup dist/:", err);
+    return null;
+  }
+}
+
+/**
+ * Restore dist/ from backup after a failed extraction.
+ */
+export function restoreFromBackup(extensionsDir: string, backupDir: string): boolean {
+  try {
+    const distDir = path.join(extensionsDir, "dist");
+    // Remove the failed extraction
+    if (fs.existsSync(distDir)) {
+      fs.rmSync(distDir, { recursive: true, force: true });
+    }
+    fs.renameSync(backupDir, distDir);
+    return true;
+  } catch (err) {
+    console.error("[podwatch/updater] Failed to restore dist/ from backup:", err);
+    return false;
+  }
+}
+
+/**
+ * Clean up backup after successful extraction.
+ */
+export function cleanupBackup(backupDir: string): void {
+  try {
+    if (fs.existsSync(backupDir)) {
+      fs.rmSync(backupDir, { recursive: true, force: true });
+    }
+  } catch {
+    // Best-effort cleanup
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Update execution (fetch download + extract with rollback)
 // ---------------------------------------------------------------------------
 
 export interface UpdateResult {
@@ -371,54 +386,46 @@ export interface UpdateResult {
 }
 
 /**
- * Download the latest podwatch tarball via npm pack.
- * Returns the tarball path on success for integrity verification.
+ * Download the podwatch tarball via fetch() from the npm registry URL.
+ * No shell commands needed — pure HTTP download.
  */
-/**
- * Download the podwatch tarball via `npx npm pack`.
- * Uses npx instead of npm directly — npx is guaranteed to be in PATH
- * since OpenClaw loads the plugin through it.
- */
-export function downloadTarball(): UpdateResult & { tmpDir?: string } {
+export async function downloadTarball(
+  version?: string,
+  tarballUrl?: string
+): Promise<UpdateResult & { tmpDir?: string }> {
   let tmpDir: string | null = null;
 
   try {
-    // 1. Create temp dir for npm pack
+    // 1. Create temp dir
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "podwatch-update-"));
 
-    // 2. npx npm pack podwatch (npx is always available since the plugin runs via it)
-    const packResult = spawnSync("npx", ["-y", "npm", "pack", "podwatch", "--pack-destination", tmpDir], {
-      encoding: "utf8",
-      timeout: NPM_PACK_TIMEOUT_MS,
-      cwd: tmpDir,
+    // 2. Determine download URL
+    const url = tarballUrl ?? `${NPM_TARBALL_URL_PREFIX}${version ?? "latest"}.tgz`;
+
+    // 3. Fetch the tarball
+    const response = await fetch(url, {
+      signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS),
     });
 
-    if (packResult.error || packResult.status !== 0) {
+    if (!response.ok) {
       return {
         success: false,
-        stdout: packResult.stdout,
-        stderr: packResult.stderr,
-        error: packResult.error?.message ?? `npx npm pack exited with status ${packResult.status}`,
+        error: `Tarball download failed: HTTP ${response.status}`,
         tmpDir,
       };
     }
 
-    // Find the tarball filename from stdout (npm pack prints the filename)
-    const tarballName = packResult.stdout.trim().split("\n").pop()?.trim();
-    if (!tarballName) {
-      return {
-        success: false,
-        stdout: packResult.stdout,
-        error: "npm pack did not output a tarball filename",
-        tmpDir,
-      };
-    }
+    const arrayBuffer = await response.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
 
+    // 4. Write to temp file
+    const tarballName = `podwatch-${version ?? "latest"}.tgz`;
     const tarballPath = path.join(tmpDir, tarballName);
+    fs.writeFileSync(tarballPath, buffer);
 
     return {
       success: true,
-      stdout: `Downloaded ${tarballName}`,
+      stdout: `Downloaded ${tarballName} (${buffer.length} bytes)`,
       tarballPath,
       tmpDir,
     };
@@ -433,6 +440,7 @@ export function downloadTarball(): UpdateResult & { tmpDir?: string } {
 
 /**
  * Install from a previously downloaded tarball by extracting to the extensions dir.
+ * Includes rollback: backs up old dist/ before extraction, restores on failure.
  */
 export function installFromTarball(tarballPath: string): UpdateResult {
   const extensionsDir = path.join(
@@ -442,15 +450,14 @@ export function installFromTarball(tarballPath: string): UpdateResult {
     "podwatch"
   );
 
-  try {
-    // 1. Clean old dist before extracting
-    const distDir = path.join(extensionsDir, "dist");
-    if (fs.existsSync(distDir)) {
-      fs.rmSync(distDir, { recursive: true, force: true });
-    }
+  let backupDir: string | null = null;
 
-    // 2. Ensure extensions dir exists
+  try {
+    // 1. Ensure extensions dir exists
     fs.mkdirSync(extensionsDir, { recursive: true });
+
+    // 2. Backup existing dist/ before replacing
+    backupDir = backupDist(extensionsDir);
 
     // 3. Extract tarball — npm pack creates tarballs with a "package/" prefix
     const extractResult = spawnSync(
@@ -463,6 +470,11 @@ export function installFromTarball(tarballPath: string): UpdateResult {
     );
 
     if (extractResult.error || extractResult.status !== 0) {
+      // Rollback on extraction failure
+      if (backupDir) {
+        restoreFromBackup(extensionsDir, backupDir);
+        console.warn("[podwatch/updater] Extraction failed — rolled back to previous version.");
+      }
       return {
         success: false,
         stdout: extractResult.stdout,
@@ -471,12 +483,22 @@ export function installFromTarball(tarballPath: string): UpdateResult {
       };
     }
 
+    // 4. Cleanup backup on success
+    if (backupDir) {
+      cleanupBackup(backupDir);
+    }
+
     const tarballName = path.basename(tarballPath);
     return {
       success: true,
       stdout: `Updated podwatch from ${tarballName}`,
     };
   } catch (err) {
+    // Rollback on any error
+    if (backupDir) {
+      restoreFromBackup(extensionsDir, backupDir);
+      console.warn("[podwatch/updater] Install failed — rolled back to previous version.");
+    }
     return {
       success: false,
       error: err instanceof Error ? err.message : String(err),
@@ -485,189 +507,59 @@ export function installFromTarball(tarballPath: string): UpdateResult {
 }
 
 /**
- * Download and install the latest podwatch plugin via npm pack + extract.
+ * Download and install the latest podwatch plugin via fetch + extract.
  * Legacy single-step function — delegates to downloadTarball + installFromTarball.
- *
- * Steps:
- * 1. `npm pack podwatch` in a temp dir to get the tarball
- * 2. Clean old dist in the extensions directory
- * 3. Extract tarball contents to ~/.openclaw/extensions/podwatch/
  */
 export function executeUpdate(): UpdateResult {
-  const download = downloadTarball();
+  // executeUpdate is sync for backward compat — use spawnSync-based fallback
+  const extensionsDir = path.join(
+    process.env.HOME ?? process.env.USERPROFILE ?? "/tmp",
+    ".openclaw",
+    "extensions",
+    "podwatch"
+  );
+
+  let tmpDir: string | null = null;
   try {
-    if (!download.success || !download.tarballPath) {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "podwatch-update-"));
+
+    // Use npx npm pack as sync fallback (downloadTarball is async)
+    const packResult = spawnSync("npx", ["-y", "npm", "pack", "podwatch", "--pack-destination", tmpDir], {
+      encoding: "utf8",
+      timeout: 120_000,
+      cwd: tmpDir,
+    });
+
+    if (packResult.error || packResult.status !== 0) {
       return {
         success: false,
-        stdout: download.stdout,
-        stderr: download.stderr,
-        error: download.error ?? "Download failed",
+        stdout: packResult.stdout,
+        stderr: packResult.stderr,
+        error: packResult.error?.message ?? `npx npm pack exited with status ${packResult.status}`,
       };
     }
 
-    return installFromTarball(download.tarballPath);
+    const tarballName = packResult.stdout.trim().split("\n").pop()?.trim();
+    if (!tarballName) {
+      return {
+        success: false,
+        stdout: packResult.stdout,
+        error: "npm pack did not output a tarball filename",
+      };
+    }
+
+    const tarballPath = path.join(tmpDir, tarballName);
+    return installFromTarball(tarballPath);
+  } catch (err) {
+    return {
+      success: false,
+      error: err instanceof Error ? err.message : String(err),
+    };
   } finally {
-    // Cleanup temp dir
-    if (download.tmpDir) {
-      try {
-        fs.rmSync(download.tmpDir, { recursive: true, force: true });
-      } catch {
-        // Best-effort cleanup
-      }
+    if (tmpDir) {
+      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best-effort */ }
     }
   }
-}
-
-// ---------------------------------------------------------------------------
-// Graceful idle window — defer restart until agent is inactive
-// ---------------------------------------------------------------------------
-
-/**
- * Wait for an idle window before proceeding with a gateway restart.
- *
- * Checks isInactive(15min). If the agent is active, defers 5 minutes and
- * re-checks. After a maximum of 2 hours of deferral, forces the restart
- * with a warning log.
- *
- * @returns true if idle window was found, false if forced after max deferral
- */
-export async function waitForIdleWindow(
-  logger: { info: (msg: string) => void; warn: (msg: string) => void; error: (msg: string) => void }
-): Promise<boolean> {
-  let totalDeferred = 0;
-
-  while (!isInactive(IDLE_THRESHOLD_MS)) {
-    if (totalDeferred >= MAX_DEFER_MS) {
-      logger.warn(
-        `[podwatch/updater] Agent still active after ${Math.round(MAX_DEFER_MS / 60_000)}min of deferral. Forcing restart.`
-      );
-      return false;
-    }
-
-    logger.info(
-      `[podwatch/updater] Agent is active — deferring restart for ${DEFER_INTERVAL_MS / 60_000}min ` +
-        `(deferred ${Math.round(totalDeferred / 60_000)}/${Math.round(MAX_DEFER_MS / 60_000)}min so far).`
-    );
-
-    await new Promise<void>((resolve) => {
-      const timer = setTimeout(resolve, DEFER_INTERVAL_MS);
-      if (timer && typeof timer === "object" && "unref" in timer) {
-        timer.unref();
-      }
-    });
-
-    totalDeferred += DEFER_INTERVAL_MS;
-  }
-
-  logger.info("[podwatch/updater] Agent is idle — proceeding with restart.");
-  return true;
-}
-
-// ---------------------------------------------------------------------------
-// Gateway restart via OS service manager
-// ---------------------------------------------------------------------------
-
-export interface RestartResult {
-  ok: boolean;
-  method: string;
-  detail?: string;
-  tried: string[];
-}
-
-/**
- * Trigger a gateway restart using the OS service manager directly.
- * Mirrors OpenClaw's triggerOpenClawRestart logic.
- *
- * Linux: systemctl --user restart <unit> (user first, then system fallback)
- * macOS: launchctl kickstart -k gui/<uid>/<label>
- * Fallback: log a manual restart message
- */
-export function triggerGatewayRestart(
-  logger: { info: (msg: string) => void; warn: (msg: string) => void; error: (msg: string) => void }
-): RestartResult {
-  const tried: string[] = [];
-
-  if (process.platform === "linux") {
-    const unit = normalizeSystemdUnit(
-      process.env.OPENCLAW_SYSTEMD_UNIT,
-      process.env.OPENCLAW_PROFILE
-    );
-
-    // Try user-level systemctl first
-    const userArgs = ["--user", "restart", unit];
-    tried.push(`systemctl ${userArgs.join(" ")}`);
-    const userRestart = spawnSync("systemctl", userArgs, {
-      encoding: "utf8",
-      timeout: SPAWN_TIMEOUT_MS,
-    });
-
-    if (!userRestart.error && userRestart.status === 0) {
-      logger.info("[podwatch/updater] Gateway restarted via systemctl --user.");
-      return { ok: true, method: "systemd", tried };
-    }
-
-    // Fall back to system-level systemctl
-    const systemArgs = ["restart", unit];
-    tried.push(`systemctl ${systemArgs.join(" ")}`);
-    const systemRestart = spawnSync("systemctl", systemArgs, {
-      encoding: "utf8",
-      timeout: SPAWN_TIMEOUT_MS,
-    });
-
-    if (!systemRestart.error && systemRestart.status === 0) {
-      logger.info("[podwatch/updater] Gateway restarted via systemctl (system).");
-      return { ok: true, method: "systemd", tried };
-    }
-
-    // Both failed
-    const detail = [
-      `user: ${userRestart.error?.message ?? `exit ${userRestart.status}`}`,
-      `system: ${systemRestart.error?.message ?? `exit ${systemRestart.status}`}`,
-    ].join("; ");
-
-    logger.error(
-      `[podwatch/updater] systemctl restart failed: ${detail}. Please restart the gateway manually.`
-    );
-    return { ok: false, method: "systemd", detail, tried };
-  }
-
-  if (process.platform === "darwin") {
-    const label =
-      process.env.OPENCLAW_LAUNCHD_LABEL ||
-      resolveGatewayLaunchAgentLabel(process.env.OPENCLAW_PROFILE);
-
-    const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
-    const target = uid !== undefined ? `gui/${uid}/${label}` : label;
-    const args = ["kickstart", "-k", target];
-    tried.push(`launchctl ${args.join(" ")}`);
-
-    const res = spawnSync("launchctl", args, {
-      encoding: "utf8",
-      timeout: SPAWN_TIMEOUT_MS,
-    });
-
-    if (!res.error && res.status === 0) {
-      logger.info("[podwatch/updater] Gateway restarted via launchctl.");
-      return { ok: true, method: "launchctl", tried };
-    }
-
-    const detail = res.error?.message ?? `exit ${res.status}`;
-    logger.error(
-      `[podwatch/updater] launchctl restart failed: ${detail}. Please restart the gateway manually.`
-    );
-    return { ok: false, method: "launchctl", detail, tried };
-  }
-
-  // Unsupported platform
-  logger.warn(
-    `[podwatch/updater] Unsupported platform "${process.platform}" for auto-restart. Please restart the gateway manually.`
-  );
-  return {
-    ok: false,
-    method: "unsupported",
-    detail: `unsupported platform: ${process.platform}`,
-    tried,
-  };
 }
 
 // ---------------------------------------------------------------------------
@@ -675,119 +567,8 @@ export function triggerGatewayRestart(
 // ---------------------------------------------------------------------------
 
 export interface UpdateOptions {
-  /** Enable auto-update. Default: true. Set false to disable. */
+  /** Enable auto-update. Default: false (opt-in for security). */
   autoUpdate?: boolean;
-}
-
-// ---------------------------------------------------------------------------
-// Urgent update trigger (called from transmitter when API signals urgent)
-// ---------------------------------------------------------------------------
-
-/** Stored references for triggering urgent updates from the transmitter. */
-let urgentUpdateState: {
-  currentVersion: string;
-  endpoint: string;
-  logger: { info: (msg: string) => void; warn: (msg: string) => void; error: (msg: string) => void };
-  options: UpdateOptions;
-} | null = null;
-
-/**
- * Handle an urgent update signal from the Podwatch API.
- * Bypasses the 24-hour cooldown and triggers an immediate update check.
- * Called by the transmitter when the API response includes { update: { urgent: true } }.
- */
-export async function handleUrgentUpdate(
-  signalVersion: string,
-  logger: { info: (msg: string) => void; warn: (msg: string) => void; error: (msg: string) => void }
-): Promise<void> {
-  if (!urgentUpdateState) {
-    logger.warn("[podwatch/updater] Urgent update signal received but updater not initialized.");
-    return;
-  }
-
-  const { currentVersion: startupVersion, endpoint, options } = urgentUpdateState;
-
-  // Skip if autoUpdate is disabled
-  if (options.autoUpdate === false) {
-    logger.info("[podwatch/updater] Urgent update signal received but auto-update is disabled.");
-    return;
-  }
-
-  // Read version from disk — startup version may be stale if plugin updated without restart
-  const currentVersion = getInstalledVersion() ?? startupVersion;
-
-  // Skip if the signaled version is not newer
-  if (compareVersions(currentVersion, signalVersion) <= 0) {
-    logger.info(
-      `[podwatch/updater] Urgent update signal for v${signalVersion} but already at v${currentVersion}. Skipping.`
-    );
-    return;
-  }
-
-  logger.info(
-    `[podwatch/updater] Urgent update signal received for v${signalVersion}. Bypassing cooldown...`
-  );
-
-  // Run the update check immediately (bypasses shouldCheckForUpdate cooldown)
-  try {
-    const result = await checkForUpdate(currentVersion, endpoint);
-    writeCacheTimestamp();
-
-    if (!result || !result.available) {
-      logger.info("[podwatch/updater] Urgent check: no update available.");
-      return;
-    }
-
-    if (!result.integrityHash) {
-      logger.warn(
-        `[podwatch/updater] Urgent check: no integrity hash for v${result.remoteVersion}. Skipping.`
-      );
-      return;
-    }
-
-    logger.info(
-      `[podwatch/updater] Urgent update: v${currentVersion} → v${result.remoteVersion}. Downloading...`
-    );
-
-    const download = downloadTarball();
-    if (!download.success || !download.tarballPath) {
-      logger.error(`[podwatch/updater] Urgent update download failed: ${download.error}`);
-      if (download.tmpDir) {
-        try { fs.rmSync(download.tmpDir, { recursive: true, force: true }); } catch { /* best-effort */ }
-      }
-      return;
-    }
-
-    try {
-      const integrity = verifyTarballIntegrity(download.tarballPath, result.integrityHash);
-      if (!integrity.valid) {
-        logger.error(
-          `[podwatch/updater] Urgent update integrity check failed! ` +
-            `Expected: ${result.integrityHash}, Got: ${integrity.actualHash ?? integrity.error}.`
-        );
-        return;
-      }
-
-      const installResult = installFromTarball(download.tarballPath);
-      if (!installResult.success) {
-        logger.error(`[podwatch/updater] Urgent update install failed: ${installResult.error}`);
-        return;
-      }
-
-      logger.info(
-        `[podwatch/updater] Urgent update installed (v${currentVersion} → v${result.remoteVersion}). Waiting for idle window before restart...`
-      );
-      await waitForIdleWindow(logger);
-      writeRestartSentinel(result.remoteVersion);
-      triggerGatewayRestart(logger);
-    } finally {
-      if (download.tmpDir) {
-        try { fs.rmSync(download.tmpDir, { recursive: true, force: true }); } catch { /* best-effort */ }
-      }
-    }
-  } catch (err) {
-    logger.error(`[podwatch/updater] Urgent update error: ${err}`);
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -798,7 +579,7 @@ export async function handleUrgentUpdate(
  * Schedule a non-blocking update check 30s after startup.
  * Safe to call synchronously — it sets a timer and returns immediately.
  *
- * Auto-update is on by default. Set autoUpdate: false in plugin config to disable.
+ * Auto-update is OFF by default. Set autoUpdate: true in plugin config to enable.
  *
  * @param currentVersion The plugin's current version from package.json
  * @param endpoint The Podwatch API endpoint (for dashboard fallback)
@@ -811,9 +592,6 @@ export function scheduleUpdateCheck(
   logger: { info: (msg: string) => void; warn: (msg: string) => void; error: (msg: string) => void },
   options: UpdateOptions = {}
 ): void {
-  // Store state for urgent update triggers from the transmitter
-  urgentUpdateState = { currentVersion, endpoint, logger, options };
-
   const timer = setTimeout(() => {
     void runUpdateCheck(currentVersion, endpoint, logger, options);
   }, STARTUP_DELAY_MS);
@@ -825,17 +603,17 @@ export function scheduleUpdateCheck(
 }
 
 /**
- * Internal: perform the actual update check + install + restart.
+ * Internal: perform the actual update check + install.
  *
  * Flow:
  * 1. Check autoUpdate opt-in (default false)
  * 2. Respect 24h cooldown
  * 3. Check for newer version (npm → dashboard fallback)
  * 4. Require integrity hash from server (skip if missing)
- * 5. Download tarball via npm pack
- * 6. Verify tarball SHA-256 against server hash
- * 7. Extract and install
- * 8. Write restart sentinel + trigger gateway restart
+ * 5. Download tarball via fetch
+ * 6. Verify tarball integrity against server hash
+ * 7. Extract and install (with rollback on failure)
+ * 8. Write restart sentinel (gateway picks it up on next restart)
  */
 export async function runUpdateCheck(
   currentVersion: string,
@@ -889,16 +667,13 @@ export async function runUpdateCheck(
       `[podwatch/updater] Update available: v${currentVersion} → v${result.remoteVersion} (via ${result.source}). Downloading...`
     );
 
-    // 4. Download tarball
-    const download = downloadTarball();
+    // 4. Download tarball via fetch
+    const download = await downloadTarball(result.remoteVersion, result.tarballUrl);
 
     if (!download.success || !download.tarballPath) {
       logger.error(
         `[podwatch/updater] Update failed: ${download.error}. Continuing with current version.`
       );
-      if (download.stderr) {
-        console.error("[podwatch/updater] stderr:", download.stderr);
-      }
       // Cleanup temp dir
       if (download.tmpDir) {
         try { fs.rmSync(download.tmpDir, { recursive: true, force: true }); } catch { /* best-effort */ }
@@ -927,7 +702,7 @@ export async function runUpdateCheck(
         `[podwatch/updater] Integrity verified (${integrity.actualHash}). Installing v${result.remoteVersion}...`
       );
 
-      // 6. Extract and install
+      // 6. Extract and install (with rollback on failure)
       const installResult = installFromTarball(download.tarballPath);
 
       if (!installResult.success) {
@@ -940,18 +715,13 @@ export async function runUpdateCheck(
         return;
       }
 
-      logger.info(
-        `[podwatch/updater] Update installed successfully (v${currentVersion} → v${result.remoteVersion}). Waiting for idle window before restart...`
-      );
-
-      // 7. Wait for idle window (defer if agent is active)
-      await waitForIdleWindow(logger);
-
-      // 8. Write restart sentinel so the gateway knows why it restarted
+      // 7. Write restart sentinel (gateway picks it up on next natural restart)
       writeRestartSentinel(result.remoteVersion);
 
-      // 9. Trigger restart via OS service manager
-      triggerGatewayRestart(logger);
+      logger.info(
+        `[podwatch/updater] Update installed successfully (v${currentVersion} → v${result.remoteVersion}). ` +
+          "Restart sentinel written — changes will take effect on next gateway restart."
+      );
     } finally {
       // Cleanup temp dir
       if (download.tmpDir) {

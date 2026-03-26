@@ -14,16 +14,30 @@
  */
 
 import type { TransmitterConfig, PodwatchEvent } from "./types.js";
-import { handleUrgentUpdate } from "./updater.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
-// Read version from package.json at build time (resolveJsonModule enabled)
-const PLUGIN_VERSION: string = (
-  JSON.parse(
-    fs.readFileSync(path.join(__dirname, "..", "package.json"), "utf-8")
-  ) as { version: string }
-).version;
+
+// Lazy version read — avoids sync I/O at module level
+let _pluginVersion: string | null = null;
+function getPluginVersion(): string {
+  if (_pluginVersion !== null) return _pluginVersion;
+  try {
+    _pluginVersion = (
+      JSON.parse(
+        fs.readFileSync(path.join(__dirname, "..", "package.json"), "utf-8")
+      ) as { version: string }
+    ).version;
+  } catch {
+    _pluginVersion = "0.0.0";
+  }
+  return _pluginVersion;
+}
+
+/** Allow register() to inject the version so we never need to read from disk. */
+export function setPluginVersion(version: string): void {
+  _pluginVersion = version;
+}
 
 // ---------------------------------------------------------------------------
 // State
@@ -41,6 +55,10 @@ const MAX_BUFFER_SIZE = 1_000;
 const BUFFER_TARGET_SIZE = 900;
 // --- Trial expired flag ---
 let trialExpired = false;
+
+// --- Shared rate limiter state (respected by flush, pulse, budget sync) ---
+let rateLimitedUntil = 0; // timestamp (ms) — skip all HTTP until this time
+const NON_RETRYABLE_4XX = new Set([400, 401, 403, 404, 422]);
 
 // --- Credential access tracking ---
 interface CredentialAccess {
@@ -83,8 +101,27 @@ function getAuditLogPath(): string {
 }
 
 const AUDIT_LOG_MAX_BYTES = 1_048_576; // 1 MB
+let auditLogPending = false;
+const auditLogQueue: Array<{ reason: string; eventCount: number; events: PodwatchEvent[] }> = [];
 
 function writeAuditLog(reason: string, eventCount: number, events: PodwatchEvent[]): void {
+  auditLogQueue.push({ reason, eventCount, events });
+  if (!auditLogPending) {
+    auditLogPending = true;
+    // Defer to microtask so we don't block the hot path (especially on 429 storms)
+    queueMicrotask(drainAuditLogQueue);
+  }
+}
+
+function drainAuditLogQueue(): void {
+  auditLogPending = false;
+  while (auditLogQueue.length > 0) {
+    const item = auditLogQueue.shift()!;
+    writeAuditLogSync(item.reason, item.eventCount, item.events);
+  }
+}
+
+function writeAuditLogSync(reason: string, eventCount: number, events: PodwatchEvent[]): void {
   try {
     const logPath = getAuditLogPath();
     const logDir = path.dirname(logPath);
@@ -376,12 +413,22 @@ function transformEvents(events: PodwatchEvent[]): Record<string, unknown>[] {
   });
 }
 
+/**
+ * Send a batch of events. Returns:
+ * - true  → batch consumed (success or non-retryable error — remove from buffer)
+ * - false → transient error (keep events in buffer for retry)
+ */
 async function sendBatch(events: PodwatchEvent[]): Promise<boolean> {
   if (!config) return false;
 
+  // Respect shared rate limit
+  if (Date.now() < rateLimitedUntil) {
+    return false; // keep events in buffer, try later
+  }
+
   const payload = {
     events: transformEvents(events),
-    pluginVersion: PLUGIN_VERSION,
+    pluginVersion: getPluginVersion(),
   };
 
   try {
@@ -397,13 +444,13 @@ async function sendBatch(events: PodwatchEvent[]): Promise<boolean> {
 
     if (response.ok) {
       retryBackoffMs = 1_000;
+      rateLimitedUntil = 0;
 
-      // Parse response body for budget state + urgent update signals
+      // Parse response body for budget state
       try {
         const body = (await response.json()) as {
           hardStop?: boolean;
           budgetExceeded?: boolean;
-          update?: { version?: string; urgent?: boolean };
         };
 
         // Budget state updates
@@ -415,16 +462,6 @@ async function sendBatch(events: PodwatchEvent[]): Promise<boolean> {
             cachedBudget.currentSpend = cachedBudget.limit;
             cachedBudget.dailySpend = cachedBudget.dailyLimit;
           }
-        }
-
-        // Urgent update signal — bypass 24h cooldown
-        if (body.update?.urgent && typeof body.update.version === "string") {
-          const logger = {
-            info: (msg: string) => console.log(msg),
-            warn: (msg: string) => console.warn(msg),
-            error: (msg: string) => console.error(msg),
-          };
-          void handleUrgentUpdate(body.update.version, logger);
         }
       } catch {
         // Response may not be JSON — that's fine
@@ -442,14 +479,40 @@ async function sendBatch(events: PodwatchEvent[]): Promise<boolean> {
       return true; // consume the batch (don't retry)
     }
 
-    // Other 4xx — client error, drop events + audit log
-    if (response.status >= 400 && response.status < 500) {
+    // 429 — rate limited. KEEP events in buffer for retry.
+    if (response.status === 429) {
+      const retryAfterHeader = response.headers?.get?.("Retry-After");
+      let retryAfterMs = retryBackoffMs * 2;
+
+      if (retryAfterHeader) {
+        const retryAfterSec = parseInt(retryAfterHeader, 10);
+        if (!isNaN(retryAfterSec) && retryAfterSec > 0) {
+          retryAfterMs = retryAfterSec * 1_000;
+        }
+      }
+
+      // Cap at 5 minutes for rate limiting
+      retryAfterMs = Math.min(retryAfterMs, 300_000);
+      rateLimitedUntil = Date.now() + retryAfterMs;
+      retryBackoffMs = Math.min(retryBackoffMs * 2, MAX_BACKOFF_MS);
+
+      console.warn(
+        `[podwatch] Rate limited (429) — retrying in ${Math.round(retryAfterMs / 1000)}s. ` +
+          `${events.length} events kept in buffer.`
+      );
+      writeAuditLog("rate_limited_429", events.length, events);
+      return false; // KEEP events in buffer
+    }
+
+    // Non-retryable 4xx — client error, drop events + audit log
+    if (NON_RETRYABLE_4XX.has(response.status)) {
       console.error(`[podwatch] API ${response.status}: dropping ${events.length} events`);
       writeAuditLog(`http_${response.status}`, events.length, events);
       retryBackoffMs = 1_000;
       return true; // Don't retry client errors
     }
 
+    // Other 4xx/5xx — transient, retry
     console.error(`[podwatch] API ${response.status}: will retry ${events.length} events`);
     return false;
   } catch (err) {
@@ -517,6 +580,8 @@ const BUDGET_SYNC_MAX_SILENT_FAILURES = 3; // Only warn after N consecutive fail
 
 async function syncBudget(): Promise<void> {
   if (!config) return;
+  // Respect shared rate limit
+  if (Date.now() < rateLimitedUntil) return;
 
   try {
     const response = await fetch(`${config.endpoint}/budget-status`, {
@@ -586,6 +651,7 @@ export const transmitter = {
     retryCount = 0;
     flushInProgress = false;
     trialExpired = false;
+    rateLimitedUntil = 0;
     activateTs = Date.now();
     knownTools.clear();
     recentCredentialAccesses.length = 0;
@@ -789,5 +855,15 @@ export const transmitter = {
   /** Whether trial has expired (for testing). */
   get isTrialExpired(): boolean {
     return trialExpired;
+  },
+
+  /** Whether we are currently rate-limited (429). Used by pulse and budget sync. */
+  get isRateLimited(): boolean {
+    return Date.now() < rateLimitedUntil;
+  },
+
+  /** Get rate limit expiry timestamp (for testing). */
+  get rateLimitedUntilTs(): number {
+    return rateLimitedUntil;
   },
 };

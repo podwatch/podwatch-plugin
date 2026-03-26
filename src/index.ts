@@ -17,7 +17,7 @@ import { registerSecurityHandlers } from "./hooks/security.js";
 import { registerSessionHandlers } from "./hooks/sessions.js";
 import { registerLifecycleHandlers } from "./hooks/lifecycle.js";
 import { registerBudgetHooks } from "./hooks/budget.js";
-import { transmitter } from "./transmitter.js";
+import { transmitter, setPluginVersion } from "./transmitter.js";
 import { scheduleUpdateCheck } from "./updater.js";
 import { startMemoryWatcher } from "./memory-watcher.js";
 import { recordActivity } from "./activity-tracker.js";
@@ -70,86 +70,105 @@ function redactForLog(obj: Record<string, unknown>): Record<string, unknown> {
  * Called by the Gateway when the plugin is loaded.
  */
 export default function register(api: PluginApi): void {
-  if (isDebug()) {
-    console.log("[podwatch:debug] register() called");
-    console.log("[podwatch:debug] api object keys:", Object.keys(api));
-    // Log only safe gateway config fields — never dump the full api.config
-    const safeConfigKeys = api.config
-      ? { diagnostics: api.config.diagnostics, agents: api.config.agents ? "(present)" : "(absent)" }
-      : "(undefined)";
-    console.log("[podwatch:debug] api.config (safe fields):", JSON.stringify(safeConfigKeys, null, 2));
-    console.log("[podwatch:debug] api.pluginConfig:", JSON.stringify(redactForLog(api.pluginConfig ?? {}), null, 2));
-    console.log("[podwatch:debug] api.runtime keys:", api.runtime ? Object.keys(api.runtime) : "undefined");
-  }
+  try {
+    if (isDebug()) {
+      console.log("[podwatch:debug] register() called");
+      console.log("[podwatch:debug] api object keys:", Object.keys(api));
+      // Log only safe gateway config fields — never dump the full api.config
+      const safeConfigKeys = api.config
+        ? { diagnostics: api.config.diagnostics, agents: api.config.agents ? "(present)" : "(absent)" }
+        : "(undefined)";
+      console.log("[podwatch:debug] api.config (safe fields):", JSON.stringify(safeConfigKeys, null, 2));
+      console.log("[podwatch:debug] api.pluginConfig:", JSON.stringify(redactForLog(api.pluginConfig ?? {}), null, 2));
+      console.log("[podwatch:debug] api.runtime keys:", api.runtime ? Object.keys(api.runtime) : "undefined");
+    }
 
-  const config = resolveConfig(api);
-  if (isDebug()) {
-    console.log("[podwatch:debug] Resolved config:", JSON.stringify(redactForLog(config as any), null, 2));
-  }
+    const config = resolveConfig(api);
+    if (isDebug()) {
+      console.log("[podwatch:debug] Resolved config:", JSON.stringify(redactForLog(config as any), null, 2));
+    }
 
-  if (!config.apiKey) {
-    api.logger.error(
-      "[podwatch] No API key configured. Set it in plugins.entries.podwatch.config.apiKey"
-    );
-    return;
-  }
+    if (!config.apiKey) {
+      api.logger.error(
+        "[podwatch] No API key configured. Set it in plugins.entries.podwatch.config.apiKey"
+      );
+      return;
+    }
 
-  // Start the transmitter (batched HTTP to Podwatch cloud)
-  transmitter.start({
-    apiKey: config.apiKey,
-    endpoint: config.endpoint ?? "https://podwatch.app/api",
-    batchSize: 50,
-    flushIntervalMs: 30_000,
-  });
+    // Inject version into transmitter so it never needs to read package.json from disk
+    const currentVersion = api.version ?? "0.0.0";
+    setPluginVersion(currentVersion);
 
-  // Check if diagnostics are enabled
-  const diagnosticsEnabled = api.config?.diagnostics?.enabled === true;
-  if (!diagnosticsEnabled) {
-    api.logger.warn(
-      "[podwatch] diagnostics.enabled is not set to true in gateway config. " +
-        "Cost tracking will not work. Enable it: diagnostics: { enabled: true }"
-    );
-    // POST setup warning to dashboard
-    transmitter.enqueue({
-      type: "setup_warning",
-      message: "Enable diagnostics for cost tracking: set diagnostics.enabled: true in openclaw.json",
-      ts: Date.now(),
+    // Start the transmitter (batched HTTP to Podwatch cloud)
+    transmitter.start({
+      apiKey: config.apiKey,
+      endpoint: config.endpoint ?? "https://podwatch.app/api",
+      batchSize: 50,
+      flushIntervalMs: 30_000,
     });
+
+    // Check if diagnostics are enabled
+    const diagnosticsEnabled = api.config?.diagnostics?.enabled === true;
+    if (!diagnosticsEnabled) {
+      api.logger.warn(
+        "[podwatch] diagnostics.enabled is not set to true in gateway config. " +
+          "Cost tracking will not work. Enable it: diagnostics: { enabled: true }"
+      );
+      // POST setup warning to dashboard
+      transmitter.enqueue({
+        type: "setup_warning",
+        message: "Enable diagnostics for cost tracking: set diagnostics.enabled: true in openclaw.json",
+        ts: Date.now(),
+      });
+    }
+
+    // Register all hook handlers — each wrapped individually so one failure
+    // doesn't prevent the others from registering.
+    try { registerCostHandler(api, config, diagnosticsEnabled); } catch (err) {
+      console.error("[podwatch] Failed to register cost handler:", err);
+    }
+    try { registerSecurityHandlers(api, config); } catch (err) {
+      console.error("[podwatch] Failed to register security handlers:", err);
+    }
+    try { registerSessionHandlers(api); } catch (err) {
+      console.error("[podwatch] Failed to register session handlers:", err);
+    }
+    try { registerLifecycleHandlers(api, config); } catch (err) {
+      console.error("[podwatch] Failed to register lifecycle handlers:", err);
+    }
+    try { registerBudgetHooks(api, config); } catch (err) {
+      console.error("[podwatch] Failed to register budget hooks:", err);
+    }
+
+    // Track agent activity for graceful restart deferral.
+    // These lightweight calls update a singleton timestamp — no I/O, no throwing.
+    api.on("before_agent_start", () => { recordActivity(); });
+    api.on("before_tool_call", () => { recordActivity(); });
+    api.on("message_received", () => { recordActivity(); });
+    api.on("session_start", () => { recordActivity(); });
+
+    // Schedule non-blocking auto-update check (30s after boot, 24h cooldown)
+    // Auto-update is opt-in (default false) for supply chain security.
+    const endpoint = config.endpoint ?? "https://podwatch.app/api";
+    scheduleUpdateCheck(currentVersion, endpoint, api.logger, { autoUpdate: config.autoUpdate });
+
+    // Start memory file watcher (non-blocking)
+    const workspaceDir = api.config?.agents?.defaults?.workspace;
+    if (workspaceDir) {
+      startMemoryWatcher(workspaceDir, endpoint, config.apiKey);
+    } else {
+      api.logger.warn("[podwatch] No workspace directory configured — memory watcher disabled");
+    }
+
+    api.logger.info(
+      `[podwatch] Plugin loaded (v${currentVersion}). Budget enforcement: ${config.enableBudgetEnforcement ? "ON" : "OFF"}, ` +
+        `Security alerts: ${config.enableSecurityAlerts ? "ON" : "OFF"}, ` +
+        `Diagnostics: ${diagnosticsEnabled ? "ON" : "OFF"}`
+    );
+  } catch (err) {
+    // Never let the plugin crash the gateway
+    console.error("[podwatch] Fatal error during register():", err);
   }
-
-  // Register all hook handlers
-  registerCostHandler(api, config, diagnosticsEnabled);
-  registerSecurityHandlers(api, config);
-  registerSessionHandlers(api);
-  registerLifecycleHandlers(api, config);
-  registerBudgetHooks(api, config);
-
-  // Track agent activity for graceful restart deferral.
-  // These lightweight calls update a singleton timestamp — no I/O, no throwing.
-  api.on("before_agent_start", () => { recordActivity(); });
-  api.on("before_tool_call", () => { recordActivity(); });
-  api.on("message_received", () => { recordActivity(); });
-  api.on("session_start", () => { recordActivity(); });
-
-  // Schedule non-blocking auto-update check (30s after boot, 24h cooldown)
-  // Auto-update is opt-in (default false) for supply chain security.
-  const currentVersion = api.version ?? "0.0.0";
-  const endpoint = config.endpoint ?? "https://podwatch.app/api";
-  scheduleUpdateCheck(currentVersion, endpoint, api.logger, { autoUpdate: config.autoUpdate });
-
-  // Start memory file watcher (non-blocking)
-  const workspaceDir = api.config?.agents?.defaults?.workspace;
-  if (workspaceDir) {
-    startMemoryWatcher(workspaceDir, endpoint, config.apiKey);
-  } else {
-    api.logger.warn("[podwatch] No workspace directory configured — memory watcher disabled");
-  }
-
-  api.logger.info(
-    `[podwatch] Plugin loaded (v${currentVersion}). Budget enforcement: ${config.enableBudgetEnforcement ? "ON" : "OFF"}, ` +
-      `Security alerts: ${config.enableSecurityAlerts ? "ON" : "OFF"}, ` +
-      `Diagnostics: ${diagnosticsEnabled ? "ON" : "OFF"}`
-  );
 }
 
 // ---------------------------------------------------------------------------
@@ -169,7 +188,7 @@ function resolveConfig(api: PluginApi): PodwatchConfig {
     endpoint: pluginConfig.endpoint ?? process.env.PODWATCH_ENDPOINT,
     enableBudgetEnforcement: pluginConfig.enableBudgetEnforcement ?? true,
     enableSecurityAlerts: pluginConfig.enableSecurityAlerts ?? true,
-    autoUpdate: pluginConfig.autoUpdate ?? true,
+    autoUpdate: pluginConfig.autoUpdate ?? false,
     // Backward compat: fall back to heartbeatIntervalMs if pulseIntervalMs not set
     pulseIntervalMs: pluginConfig.pulseIntervalMs ?? pluginConfig.heartbeatIntervalMs ?? 300_000,
     scanIntervalMs: pluginConfig.scanIntervalMs ?? 21_600_000, // 6 hours

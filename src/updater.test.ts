@@ -7,11 +7,8 @@
  * - NPM registry version check
  * - Dashboard API fallback version check
  * - Update execution via npm pack + extract
+ * - Rollback mechanism on extraction failure
  * - Restart sentinel writing
- * - Service name resolution (systemd unit, launchd label)
- * - Gateway restart via systemctl (Linux)
- * - Gateway restart via launchctl (macOS)
- * - Fallback logging for unsupported platforms
  * - Error handling (network failures, bad JSON, timeouts)
  */
 
@@ -35,6 +32,7 @@ const mockMkdirSync = vi.fn();
 const mockExistsSync = vi.fn();
 const mockMkdtempSync = vi.fn();
 const mockRmSync = vi.fn();
+const mockRenameSync = vi.fn();
 
 vi.mock("node:fs", () => ({
   default: {
@@ -44,6 +42,7 @@ vi.mock("node:fs", () => ({
     existsSync: (...args: unknown[]) => mockExistsSync(...args),
     mkdtempSync: (...args: unknown[]) => mockMkdtempSync(...args),
     rmSync: (...args: unknown[]) => mockRmSync(...args),
+    renameSync: (...args: unknown[]) => mockRenameSync(...args),
   },
   readFileSync: (...args: unknown[]) => mockReadFileSync(...args),
   writeFileSync: (...args: unknown[]) => mockWriteFileSync(...args),
@@ -51,6 +50,7 @@ vi.mock("node:fs", () => ({
   existsSync: (...args: unknown[]) => mockExistsSync(...args),
   mkdtempSync: (...args: unknown[]) => mockMkdtempSync(...args),
   rmSync: (...args: unknown[]) => mockRmSync(...args),
+  renameSync: (...args: unknown[]) => mockRenameSync(...args),
 }));
 
 // Mock os
@@ -79,6 +79,7 @@ function resetMocks() {
   mockExistsSync.mockReset();
   mockMkdtempSync.mockReset();
   mockRmSync.mockReset();
+  mockRenameSync.mockReset();
   mockFetch.mockReset();
 }
 
@@ -90,17 +91,17 @@ import {
   shouldCheckForUpdate,
   writeCacheTimestamp,
   writeRestartSentinel,
-  triggerGatewayRestart,
   resolveStateDir,
-  resolveGatewaySystemdServiceName,
-  resolveGatewayLaunchAgentLabel,
-  normalizeSystemdUnit,
   runUpdateCheck,
   verifyTarballIntegrity,
   parseSriHash,
-  handleUrgentUpdate,
   scheduleUpdateCheck,
   AUTO_UPDATE_CACHE_FILE,
+  backupDist,
+  restoreFromBackup,
+  cleanupBackup,
+  installFromTarball,
+  downloadTarball,
 } from "./updater.js";
 
 // ---------------------------------------------------------------------------
@@ -112,6 +113,17 @@ function jsonResponse(data: unknown, status = 200): Response {
     ok: status >= 200 && status < 300,
     status,
     json: () => Promise.resolve(data),
+    headers: new Headers(),
+  } as Response;
+}
+
+function binaryResponse(data: Buffer, status = 200): Response {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    json: () => Promise.resolve({}),
+    arrayBuffer: () => Promise.resolve(data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength)),
+    headers: new Headers(),
   } as Response;
 }
 
@@ -407,32 +419,6 @@ describe("executeUpdate", () => {
     expect(result.error).toContain("tar failed");
   });
 
-  it("cleans old dist directory before extracting", () => {
-    // dist exists
-    mockExistsSync.mockReturnValue(true);
-    // npm pack succeeds
-    mockSpawnSync
-      .mockReturnValueOnce({
-        error: null,
-        status: 0,
-        stdout: "podwatch-1.1.0.tgz\n",
-        stderr: "",
-      })
-      // tar extract succeeds
-      .mockReturnValueOnce({
-        error: null,
-        status: 0,
-        stdout: "",
-        stderr: "",
-      });
-
-    executeUpdate();
-    expect(mockRmSync).toHaveBeenCalledWith(
-      expect.stringContaining("dist"),
-      { recursive: true, force: true }
-    );
-  });
-
   it("cleans up temp dir after success", () => {
     // npm pack succeeds
     mockSpawnSync
@@ -562,319 +548,6 @@ describe("resolveStateDir", () => {
   });
 });
 
-describe("service name resolution", () => {
-  describe("resolveGatewaySystemdServiceName", () => {
-    it("returns default name for undefined profile", () => {
-      expect(resolveGatewaySystemdServiceName(undefined)).toBe("openclaw-gateway");
-    });
-
-    it("returns default name for 'default' profile", () => {
-      expect(resolveGatewaySystemdServiceName("default")).toBe("openclaw-gateway");
-    });
-
-    it("returns profiled name for custom profile", () => {
-      expect(resolveGatewaySystemdServiceName("myprofile")).toBe("openclaw-gateway-myprofile");
-    });
-
-    it("trims whitespace", () => {
-      expect(resolveGatewaySystemdServiceName("  myprofile  ")).toBe("openclaw-gateway-myprofile");
-    });
-  });
-
-  describe("resolveGatewayLaunchAgentLabel", () => {
-    it("returns default label for undefined profile", () => {
-      expect(resolveGatewayLaunchAgentLabel(undefined)).toBe("ai.openclaw.gateway");
-    });
-
-    it("returns default label for 'default' profile", () => {
-      expect(resolveGatewayLaunchAgentLabel("default")).toBe("ai.openclaw.gateway");
-    });
-
-    it("returns profiled label for custom profile", () => {
-      expect(resolveGatewayLaunchAgentLabel("myprofile")).toBe("ai.openclaw.myprofile");
-    });
-  });
-
-  describe("normalizeSystemdUnit", () => {
-    it("appends .service when missing", () => {
-      expect(normalizeSystemdUnit("my-unit", undefined)).toBe("my-unit.service");
-    });
-
-    it("does not double-append .service", () => {
-      expect(normalizeSystemdUnit("my-unit.service", undefined)).toBe("my-unit.service");
-    });
-
-    it("uses raw unit name when provided", () => {
-      expect(normalizeSystemdUnit("custom-unit", undefined)).toBe("custom-unit.service");
-    });
-
-    it("falls back to default when raw is undefined", () => {
-      expect(normalizeSystemdUnit(undefined, undefined)).toBe("openclaw-gateway.service");
-    });
-
-    it("falls back to profiled name when raw is empty", () => {
-      expect(normalizeSystemdUnit("", "staging")).toBe("openclaw-gateway-staging.service");
-    });
-  });
-});
-
-describe("triggerGatewayRestart", () => {
-  const originalPlatform = process.platform;
-  let savedEnv: Record<string, string | undefined>;
-
-  beforeEach(() => {
-    resetMocks();
-    savedEnv = {
-      OPENCLAW_SYSTEMD_UNIT: process.env.OPENCLAW_SYSTEMD_UNIT,
-      OPENCLAW_PROFILE: process.env.OPENCLAW_PROFILE,
-      OPENCLAW_LAUNCHD_LABEL: process.env.OPENCLAW_LAUNCHD_LABEL,
-    };
-    delete process.env.OPENCLAW_SYSTEMD_UNIT;
-    delete process.env.OPENCLAW_PROFILE;
-    delete process.env.OPENCLAW_LAUNCHD_LABEL;
-  });
-
-  afterEach(() => {
-    Object.defineProperty(process, "platform", { value: originalPlatform });
-    for (const [key, val] of Object.entries(savedEnv)) {
-      if (val === undefined) delete process.env[key];
-      else process.env[key] = val;
-    }
-  });
-
-  describe("Linux (systemd)", () => {
-    beforeEach(() => {
-      Object.defineProperty(process, "platform", { value: "linux" });
-    });
-
-    it("tries systemctl --user restart first", () => {
-      mockSpawnSync.mockReturnValueOnce({ error: null, status: 0, stdout: "", stderr: "" });
-
-      const logger = mockLogger();
-      const result = triggerGatewayRestart(logger);
-
-      expect(result.ok).toBe(true);
-      expect(result.method).toBe("systemd");
-      expect(mockSpawnSync).toHaveBeenCalledWith(
-        "systemctl",
-        ["--user", "restart", "openclaw-gateway.service"],
-        expect.any(Object)
-      );
-      expect(logger.info).toHaveBeenCalledWith(
-        expect.stringContaining("systemctl --user")
-      );
-    });
-
-    it("falls back to system systemctl when user fails", () => {
-      // User-level fails
-      mockSpawnSync
-        .mockReturnValueOnce({ error: null, status: 1, stdout: "", stderr: "failed" })
-        // System-level succeeds
-        .mockReturnValueOnce({ error: null, status: 0, stdout: "", stderr: "" });
-
-      const logger = mockLogger();
-      const result = triggerGatewayRestart(logger);
-
-      expect(result.ok).toBe(true);
-      expect(result.method).toBe("systemd");
-      expect(mockSpawnSync).toHaveBeenCalledTimes(2);
-      expect(mockSpawnSync).toHaveBeenNthCalledWith(
-        2,
-        "systemctl",
-        ["restart", "openclaw-gateway.service"],
-        expect.any(Object)
-      );
-    });
-
-    it("reports failure when both systemctl calls fail", () => {
-      mockSpawnSync
-        .mockReturnValueOnce({ error: null, status: 1, stdout: "", stderr: "" })
-        .mockReturnValueOnce({ error: null, status: 1, stdout: "", stderr: "" });
-
-      const logger = mockLogger();
-      const result = triggerGatewayRestart(logger);
-
-      expect(result.ok).toBe(false);
-      expect(result.method).toBe("systemd");
-      expect(result.tried).toHaveLength(2);
-      expect(logger.error).toHaveBeenCalledOnce();
-      expect(logger.error.mock.calls[0][0]).toContain("restart the gateway manually");
-    });
-
-    it("uses OPENCLAW_SYSTEMD_UNIT env var", () => {
-      process.env.OPENCLAW_SYSTEMD_UNIT = "my-custom-unit";
-      mockSpawnSync.mockReturnValueOnce({ error: null, status: 0, stdout: "", stderr: "" });
-
-      const logger = mockLogger();
-      triggerGatewayRestart(logger);
-
-      expect(mockSpawnSync).toHaveBeenCalledWith(
-        "systemctl",
-        ["--user", "restart", "my-custom-unit.service"],
-        expect.any(Object)
-      );
-    });
-
-    it("uses OPENCLAW_PROFILE env var for service name", () => {
-      process.env.OPENCLAW_PROFILE = "staging";
-      mockSpawnSync.mockReturnValueOnce({ error: null, status: 0, stdout: "", stderr: "" });
-
-      const logger = mockLogger();
-      triggerGatewayRestart(logger);
-
-      expect(mockSpawnSync).toHaveBeenCalledWith(
-        "systemctl",
-        ["--user", "restart", "openclaw-gateway-staging.service"],
-        expect.any(Object)
-      );
-    });
-
-    it("handles spawnSync errors", () => {
-      mockSpawnSync
-        .mockReturnValueOnce({
-          error: new Error("ENOENT"),
-          status: null,
-          stdout: "",
-          stderr: "",
-        })
-        .mockReturnValueOnce({
-          error: new Error("ENOENT"),
-          status: null,
-          stdout: "",
-          stderr: "",
-        });
-
-      const logger = mockLogger();
-      const result = triggerGatewayRestart(logger);
-
-      expect(result.ok).toBe(false);
-      expect(result.detail).toContain("ENOENT");
-    });
-  });
-
-  describe("macOS (launchctl)", () => {
-    beforeEach(() => {
-      Object.defineProperty(process, "platform", { value: "darwin" });
-    });
-
-    it("uses launchctl kickstart -k", () => {
-      mockSpawnSync.mockReturnValueOnce({ error: null, status: 0, stdout: "", stderr: "" });
-
-      const logger = mockLogger();
-      const result = triggerGatewayRestart(logger);
-
-      expect(result.ok).toBe(true);
-      expect(result.method).toBe("launchctl");
-      expect(mockSpawnSync).toHaveBeenCalledWith(
-        "launchctl",
-        expect.arrayContaining(["kickstart", "-k"]),
-        expect.any(Object)
-      );
-      expect(logger.info).toHaveBeenCalledWith(
-        expect.stringContaining("launchctl")
-      );
-    });
-
-    it("includes gui/<uid> in target when getuid available", () => {
-      const originalGetuid = process.getuid;
-      process.getuid = () => 501;
-
-      mockSpawnSync.mockReturnValueOnce({ error: null, status: 0, stdout: "", stderr: "" });
-
-      const logger = mockLogger();
-      triggerGatewayRestart(logger);
-
-      expect(mockSpawnSync).toHaveBeenCalledWith(
-        "launchctl",
-        ["kickstart", "-k", "gui/501/ai.openclaw.gateway"],
-        expect.any(Object)
-      );
-
-      process.getuid = originalGetuid;
-    });
-
-    it("uses OPENCLAW_LAUNCHD_LABEL env var", () => {
-      process.env.OPENCLAW_LAUNCHD_LABEL = "com.custom.gateway";
-      const originalGetuid = process.getuid;
-      process.getuid = () => 501;
-
-      mockSpawnSync.mockReturnValueOnce({ error: null, status: 0, stdout: "", stderr: "" });
-
-      const logger = mockLogger();
-      triggerGatewayRestart(logger);
-
-      expect(mockSpawnSync).toHaveBeenCalledWith(
-        "launchctl",
-        ["kickstart", "-k", "gui/501/com.custom.gateway"],
-        expect.any(Object)
-      );
-
-      process.getuid = originalGetuid;
-    });
-
-    it("uses OPENCLAW_PROFILE for label resolution", () => {
-      process.env.OPENCLAW_PROFILE = "staging";
-      const originalGetuid = process.getuid;
-      process.getuid = () => 501;
-
-      mockSpawnSync.mockReturnValueOnce({ error: null, status: 0, stdout: "", stderr: "" });
-
-      const logger = mockLogger();
-      triggerGatewayRestart(logger);
-
-      expect(mockSpawnSync).toHaveBeenCalledWith(
-        "launchctl",
-        ["kickstart", "-k", "gui/501/ai.openclaw.staging"],
-        expect.any(Object)
-      );
-
-      process.getuid = originalGetuid;
-    });
-
-    it("reports failure when launchctl fails", () => {
-      mockSpawnSync.mockReturnValueOnce({
-        error: new Error("launchctl not found"),
-        status: null,
-        stdout: "",
-        stderr: "",
-      });
-
-      const logger = mockLogger();
-      const result = triggerGatewayRestart(logger);
-
-      expect(result.ok).toBe(false);
-      expect(result.method).toBe("launchctl");
-      expect(logger.error).toHaveBeenCalledOnce();
-      expect(logger.error.mock.calls[0][0]).toContain("restart the gateway manually");
-    });
-  });
-
-  describe("unsupported platform", () => {
-    it("returns failure for Windows", () => {
-      Object.defineProperty(process, "platform", { value: "win32" });
-
-      const logger = mockLogger();
-      const result = triggerGatewayRestart(logger);
-
-      expect(result.ok).toBe(false);
-      expect(result.method).toBe("unsupported");
-      expect(logger.warn).toHaveBeenCalledWith(
-        expect.stringContaining("Unsupported platform")
-      );
-    });
-
-    it("returns failure for FreeBSD", () => {
-      Object.defineProperty(process, "platform", { value: "freebsd" });
-
-      const logger = mockLogger();
-      const result = triggerGatewayRestart(logger);
-
-      expect(result.ok).toBe(false);
-      expect(result.method).toBe("unsupported");
-    });
-  });
-});
-
 // ---------------------------------------------------------------------------
 // Auto-update opt-in (autoUpdate config option)
 // ---------------------------------------------------------------------------
@@ -965,17 +638,10 @@ describe("verifyTarballIntegrity", () => {
 // ---------------------------------------------------------------------------
 
 describe("runUpdateCheck — integrity verification", () => {
-  const originalPlatform = process.platform;
-
   beforeEach(() => {
     resetMocks();
     // Make shouldCheckForUpdate() return true (no cache file)
     mockExistsSync.mockReturnValue(false);
-    Object.defineProperty(process, "platform", { value: "linux" });
-  });
-
-  afterEach(() => {
-    Object.defineProperty(process, "platform", { value: originalPlatform });
   });
 
   it("verifies tarball integrity against server-provided SRI hash", async () => {
@@ -989,18 +655,13 @@ describe("runUpdateCheck — integrity verification", () => {
     mockFetch.mockResolvedValueOnce(jsonResponse({}, 500));
     // dashboard returns version + integrityHash (SRI format)
     mockFetch.mockResolvedValueOnce(jsonResponse({ version: "1.1.0", integrityHash: sriHash }));
+    // downloadTarball fetches the tarball
+    mockFetch.mockResolvedValueOnce(binaryResponse(tarballContent));
 
-    // npm pack succeeds
     mockMkdtempSync.mockReturnValue("/tmp/podwatch-update-abc");
-    mockSpawnSync
-      .mockReturnValueOnce({
-        error: null, status: 0,
-        stdout: "podwatch-1.1.0.tgz\n", stderr: "",
-      })
-      // tar extract succeeds
-      .mockReturnValueOnce({ error: null, status: 0, stdout: "", stderr: "" })
-      // systemctl restart
-      .mockReturnValueOnce({ error: null, status: 0, stdout: "", stderr: "" });
+
+    // tar extract succeeds
+    mockSpawnSync.mockReturnValueOnce({ error: null, status: 0, stdout: "", stderr: "" });
 
     // Mock reading tarball for hash verification
     mockReadFileSync.mockReturnValueOnce(tarballContent);
@@ -1010,39 +671,6 @@ describe("runUpdateCheck — integrity verification", () => {
     // Should have logged the integrity hash
     expect(logger.info).toHaveBeenCalledWith(
       expect.stringContaining(`sha512-${tarballDigest}`)
-    );
-  });
-
-  it("verifies tarball with npm dist.integrity SRI hash (sha512)", async () => {
-    const logger = mockLogger();
-    const crypto = require("node:crypto");
-    const tarballContent = Buffer.from("npm tarball content");
-    const tarballDigest = crypto.createHash("sha512").update(tarballContent).digest("base64");
-    const sriHash = `sha512-${tarballDigest}`;
-
-    // npm registry returns version + dist.integrity (real npm format)
-    mockFetch.mockResolvedValueOnce(jsonResponse({
-      version: "1.2.0",
-      dist: { integrity: sriHash, shasum: "abc123", tarball: "https://registry.npmjs.org/podwatch/-/podwatch-1.2.0.tgz" },
-    }));
-
-    mockMkdtempSync.mockReturnValue("/tmp/podwatch-update-abc");
-    mockSpawnSync
-      .mockReturnValueOnce({ error: null, status: 0, stdout: "podwatch-1.2.0.tgz\n", stderr: "" })
-      .mockReturnValueOnce({ error: null, status: 0, stdout: "", stderr: "" })
-      .mockReturnValueOnce({ error: null, status: 0, stdout: "", stderr: "" });
-
-    mockReadFileSync.mockReturnValueOnce(tarballContent);
-
-    await runUpdateCheck("1.0.0", "https://podwatch.app/api", logger, { autoUpdate: true });
-
-    // Should succeed — logged integrity verified
-    expect(logger.info).toHaveBeenCalledWith(
-      expect.stringContaining("Integrity verified")
-    );
-    // Should have triggered install
-    expect(logger.info).toHaveBeenCalledWith(
-      expect.stringContaining("v1.0.0 → v1.2.0")
     );
   });
 
@@ -1056,13 +684,10 @@ describe("runUpdateCheck — integrity verification", () => {
       version: "1.1.0",
       integrityHash: "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
     }));
+    // downloadTarball fetches the tarball
+    mockFetch.mockResolvedValueOnce(binaryResponse(Buffer.from("different content")));
 
-    // npm pack succeeds
     mockMkdtempSync.mockReturnValue("/tmp/podwatch-update-abc");
-    mockSpawnSync.mockReturnValueOnce({
-      error: null, status: 0,
-      stdout: "podwatch-1.1.0.tgz\n", stderr: "",
-    });
 
     // Mock reading tarball — content won't match the SRI hash
     mockReadFileSync.mockReturnValueOnce(Buffer.from("different content"));
@@ -1092,76 +717,47 @@ describe("runUpdateCheck — integrity verification", () => {
     expect(logger.warn).toHaveBeenCalledWith(
       expect.stringContaining("No integrity hash")
     );
-    // Should NOT have called npm pack (update skipped)
-    const npmPackCalls = mockSpawnSync.mock.calls.filter(
-      (call: unknown[]) => call[0] === "npm"
-    );
-    expect(npmPackCalls).toHaveLength(0);
   });
 
-  it("logs the downloaded package integrity on successful update", async () => {
+  it("writes restart sentinel but does NOT trigger gateway restart", async () => {
     const logger = mockLogger();
     const crypto = require("node:crypto");
-    const tarballContent = Buffer.from("real tarball bytes");
+    const tarballContent = Buffer.from("update content");
     const tarballDigest = crypto.createHash("sha512").update(tarballContent).digest("base64");
     const sriHash = `sha512-${tarballDigest}`;
 
     // npm registry fails → dashboard has hash
     mockFetch.mockResolvedValueOnce(jsonResponse({}, 500));
     mockFetch.mockResolvedValueOnce(jsonResponse({ version: "1.1.0", integrityHash: sriHash }));
+    // downloadTarball fetches the tarball
+    mockFetch.mockResolvedValueOnce(binaryResponse(tarballContent));
 
-    // npm pack succeeds
     mockMkdtempSync.mockReturnValue("/tmp/podwatch-update-abc");
-    mockSpawnSync
-      .mockReturnValueOnce({
-        error: null, status: 0,
-        stdout: "podwatch-1.1.0.tgz\n", stderr: "",
-      })
-      // tar extract succeeds
-      .mockReturnValueOnce({ error: null, status: 0, stdout: "", stderr: "" })
-      // systemctl restart
-      .mockReturnValueOnce({ error: null, status: 0, stdout: "", stderr: "" });
+
+    // tar extract succeeds
+    mockSpawnSync.mockReturnValueOnce({ error: null, status: 0, stdout: "", stderr: "" });
 
     // Mock reading tarball for hash verification
     mockReadFileSync.mockReturnValueOnce(tarballContent);
 
     await runUpdateCheck("1.0.0", "https://podwatch.app/api", logger, { autoUpdate: true });
 
-    // Should log the integrity hash for audit trail
-    const integrityLogCalls = logger.info.mock.calls.filter(
-      (call: string[]) => call[0].includes("integrity:")
+    // Should have written sentinel
+    expect(mockWriteFileSync).toHaveBeenCalledWith(
+      expect.stringContaining("restart-sentinel.json"),
+      expect.any(String),
+      "utf-8"
     );
-    expect(integrityLogCalls.length).toBeGreaterThan(0);
-    expect(integrityLogCalls[0][0]).toContain(sriHash);
-  });
 
-  it("logs clearly what version is being installed", async () => {
-    const logger = mockLogger();
-    const crypto = require("node:crypto");
-    const tarballContent = Buffer.from("notification test");
-    const tarballDigest = crypto.createHash("sha512").update(tarballContent).digest("base64");
-    const sriHash = `sha512-${tarballDigest}`;
+    // Should NOT have called systemctl or launchctl (no gateway restart)
+    const restartCalls = mockSpawnSync.mock.calls.filter(
+      (call: unknown[]) => call[0] === "systemctl" || call[0] === "launchctl"
+    );
+    expect(restartCalls).toHaveLength(0);
 
-    // npm registry fails → dashboard has hash
-    mockFetch.mockResolvedValueOnce(jsonResponse({}, 500));
-    mockFetch.mockResolvedValueOnce(jsonResponse({ version: "2.0.0", integrityHash: sriHash }));
-
-    mockMkdtempSync.mockReturnValue("/tmp/podwatch-update-abc");
-    mockSpawnSync
-      .mockReturnValueOnce({
-        error: null, status: 0,
-        stdout: "podwatch-2.0.0.tgz\n", stderr: "",
-      })
-      .mockReturnValueOnce({ error: null, status: 0, stdout: "", stderr: "" })
-      .mockReturnValueOnce({ error: null, status: 0, stdout: "", stderr: "" });
-
-    mockReadFileSync.mockReturnValueOnce(tarballContent);
-
-    await runUpdateCheck("1.0.0", "https://podwatch.app/api", logger, { autoUpdate: true });
-
-    // Should clearly log what's being installed
+    // Should log that restart sentinel was written
     expect(logger.info).toHaveBeenCalledWith(
-      expect.stringContaining("v1.0.0 → v2.0.0")
+      expect.stringContaining("Restart sentinel written")
     );
   });
 });
@@ -1289,12 +885,9 @@ describe("checkForUpdate — npm dist.integrity", () => {
     }));
 
     const result = await checkForUpdate("1.0.0", "https://podwatch.app/api");
-    expect(result).toEqual({
-      available: true,
-      remoteVersion: "1.2.0",
-      source: "npm",
-      integrityHash: sriHash,
-    });
+    expect(result?.available).toBe(true);
+    expect(result?.integrityHash).toBe(sriHash);
+    expect(result?.tarballUrl).toBe("https://registry.npmjs.org/podwatch/-/podwatch-1.2.0.tgz");
   });
 
   it("returns undefined integrityHash when npm has no dist.integrity", async () => {
@@ -1327,146 +920,171 @@ describe("checkForUpdate — npm dist.integrity", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Urgent update mechanism
+// Rollback mechanism
 // ---------------------------------------------------------------------------
 
-describe("handleUrgentUpdate", () => {
-  const originalPlatform = process.platform;
-
+describe("rollback mechanism", () => {
   beforeEach(() => {
     resetMocks();
-    Object.defineProperty(process, "platform", { value: "linux" });
-    // Make shouldCheckForUpdate return false (within cooldown) to prove urgent bypasses it
-    mockExistsSync.mockReturnValue(true);
-    const recentTime = Date.now() - 1 * 60 * 60 * 1000; // 1 hour ago
-    mockReadFileSync.mockReturnValue(JSON.stringify({ lastCheckTs: recentTime }));
   });
 
-  afterEach(() => {
-    Object.defineProperty(process, "platform", { value: originalPlatform });
-  });
-
-  it("logs warning when updater not initialized", async () => {
-    // Don't call scheduleUpdateCheck — urgentUpdateState is null
-    // But we need to be careful: previous tests may have called it.
-    // handleUrgentUpdate checks urgentUpdateState internally.
-    const logger = mockLogger();
-
-    // We can't easily reset the module state, but we can test the signal path
-    // by calling scheduleUpdateCheck first, then handleUrgentUpdate
-    // Let's test the full flow instead
-  });
-
-  it("triggers immediate update check bypassing cooldown", async () => {
-    const logger = mockLogger();
-    const crypto = require("node:crypto");
-    const tarballContent = Buffer.from("urgent update content");
-    const tarballDigest = crypto.createHash("sha512").update(tarballContent).digest("base64");
-    const sriHash = `sha512-${tarballDigest}`;
-
-    // Initialize the updater state via scheduleUpdateCheck
-    scheduleUpdateCheck("1.0.0", "https://podwatch.app/api", logger, { autoUpdate: true });
-
-    // Reset mocks after scheduleUpdateCheck (it sets a timer that calls fetch)
-    resetMocks();
-
-    // npm returns newer version with integrity
-    mockFetch.mockResolvedValueOnce(jsonResponse({
-      version: "1.2.0",
-      dist: { integrity: sriHash },
-    }));
-
-    // getInstalledVersion reads package.json from disk — return current (old) version
-    mockReadFileSync.mockReturnValueOnce(JSON.stringify({ version: "1.0.0" }));
-
-    // npm pack + tar extract + systemctl restart
-    mockMkdtempSync.mockReturnValue("/tmp/podwatch-urgent-abc");
-    mockSpawnSync
-      .mockReturnValueOnce({ error: null, status: 0, stdout: "podwatch-1.2.0.tgz\n", stderr: "" })
-      .mockReturnValueOnce({ error: null, status: 0, stdout: "", stderr: "" })
-      .mockReturnValueOnce({ error: null, status: 0, stdout: "", stderr: "" });
-
-    mockReadFileSync.mockReturnValueOnce(tarballContent);
-
-    await handleUrgentUpdate("1.2.0", logger);
-
-    // Should have proceeded with update
-    expect(logger.info).toHaveBeenCalledWith(
-      expect.stringContaining("Urgent update signal received")
-    );
-    expect(logger.info).toHaveBeenCalledWith(
-      expect.stringContaining("Urgent update installed")
-    );
-  });
-
-  it("skips if autoUpdate is disabled", async () => {
-    const logger = mockLogger();
-
-    // Initialize with autoUpdate: false
-    scheduleUpdateCheck("1.0.0", "https://podwatch.app/api", logger, { autoUpdate: false });
-    resetMocks();
-
-    await handleUrgentUpdate("1.2.0", logger);
-
-    expect(logger.info).toHaveBeenCalledWith(
-      expect.stringContaining("auto-update is disabled")
-    );
-    expect(mockFetch).not.toHaveBeenCalled();
-  });
-
-  it("skips if signaled version is not newer", async () => {
-    const logger = mockLogger();
-
-    // Initialize at v2.0.0
-    scheduleUpdateCheck("2.0.0", "https://podwatch.app/api", logger, { autoUpdate: true });
-    resetMocks();
-
-    await handleUrgentUpdate("1.5.0", logger);
-
-    expect(logger.info).toHaveBeenCalledWith(
-      expect.stringContaining("already at v2.0.0")
-    );
-    expect(mockFetch).not.toHaveBeenCalled();
-  });
-
-  it("skips if no integrity hash available", async () => {
-    const logger = mockLogger();
-
-    scheduleUpdateCheck("1.0.0", "https://podwatch.app/api", logger, { autoUpdate: true });
-    resetMocks();
-
-    // npm returns version without dist.integrity
-    mockFetch.mockResolvedValueOnce(jsonResponse({ version: "1.2.0" }));
-
-    await handleUrgentUpdate("1.2.0", logger);
-
-    expect(logger.warn).toHaveBeenCalledWith(
-      expect.stringContaining("no integrity hash")
-    );
-  });
-
-  it("aborts if integrity check fails", async () => {
-    const logger = mockLogger();
-
-    scheduleUpdateCheck("1.0.0", "https://podwatch.app/api", logger, { autoUpdate: true });
-    resetMocks();
-
-    // npm returns version with wrong integrity hash
-    mockFetch.mockResolvedValueOnce(jsonResponse({
-      version: "1.2.0",
-      dist: { integrity: "sha512-WRONGHASH==" },
-    }));
-
-    mockMkdtempSync.mockReturnValue("/tmp/podwatch-urgent-abc");
-    mockSpawnSync.mockReturnValueOnce({
-      error: null, status: 0, stdout: "podwatch-1.2.0.tgz\n", stderr: "",
+  it("backupDist renames dist/ to dist.backup/", () => {
+    mockExistsSync.mockImplementation((p: string) => {
+      if (p.endsWith("dist")) return true;
+      if (p.endsWith("dist.backup")) return false;
+      return false;
     });
-    mockReadFileSync.mockReturnValueOnce(Buffer.from("actual content"));
 
-    await handleUrgentUpdate("1.2.0", logger);
-
-    expect(logger.error).toHaveBeenCalledWith(
-      expect.stringContaining("integrity check failed")
+    const result = backupDist("/ext/podwatch");
+    expect(result).toBe("/ext/podwatch/dist.backup");
+    expect(mockRenameSync).toHaveBeenCalledWith(
+      "/ext/podwatch/dist",
+      "/ext/podwatch/dist.backup"
     );
+  });
+
+  it("backupDist returns null if no dist/ exists", () => {
+    mockExistsSync.mockReturnValue(false);
+
+    const result = backupDist("/ext/podwatch");
+    expect(result).toBeNull();
+  });
+
+  it("backupDist removes stale backup before creating new one", () => {
+    mockExistsSync.mockReturnValue(true);
+
+    backupDist("/ext/podwatch");
+    expect(mockRmSync).toHaveBeenCalledWith(
+      "/ext/podwatch/dist.backup",
+      { recursive: true, force: true }
+    );
+  });
+
+  it("restoreFromBackup moves backup back to dist/", () => {
+    mockExistsSync.mockReturnValue(false);
+
+    const result = restoreFromBackup("/ext/podwatch", "/ext/podwatch/dist.backup");
+    expect(result).toBe(true);
+    expect(mockRenameSync).toHaveBeenCalledWith(
+      "/ext/podwatch/dist.backup",
+      "/ext/podwatch/dist"
+    );
+  });
+
+  it("cleanupBackup removes backup dir", () => {
+    mockExistsSync.mockReturnValue(true);
+
+    cleanupBackup("/ext/podwatch/dist.backup");
+    expect(mockRmSync).toHaveBeenCalledWith(
+      "/ext/podwatch/dist.backup",
+      { recursive: true, force: true }
+    );
+  });
+
+  it("installFromTarball rolls back on extraction failure", () => {
+    // dist exists
+    mockExistsSync.mockImplementation((p: string) => {
+      if (typeof p === "string" && p.endsWith("dist.backup")) return false;
+      if (typeof p === "string" && p.endsWith("dist")) return true;
+      return false;
+    });
+
+    // tar extract fails
+    mockSpawnSync.mockReturnValueOnce({
+      error: new Error("tar failed"),
+      status: 1,
+      stdout: "",
+      stderr: "error extracting",
+    });
+
+    const result = installFromTarball("/tmp/test.tgz");
+    expect(result.success).toBe(false);
+
+    // Should have backed up (rename dist → dist.backup)
+    expect(mockRenameSync).toHaveBeenCalledWith(
+      expect.stringContaining("dist"),
+      expect.stringContaining("dist.backup")
+    );
+
+    // Should have attempted rollback (rename dist.backup → dist)
+    // renameSync is called twice: once for backup, once for restore
+    expect(mockRenameSync).toHaveBeenCalledTimes(2);
+  });
+
+  it("installFromTarball cleans up backup on success", () => {
+    // dist exists
+    mockExistsSync.mockImplementation((p: string) => {
+      if (typeof p === "string" && p.endsWith("dist.backup")) return true;
+      if (typeof p === "string" && p.endsWith("dist")) return true;
+      return false;
+    });
+
+    // tar extract succeeds
+    mockSpawnSync.mockReturnValueOnce({
+      error: null,
+      status: 0,
+      stdout: "",
+      stderr: "",
+    });
+
+    const result = installFromTarball("/tmp/test.tgz");
+    expect(result.success).toBe(true);
+
+    // Should have cleaned up backup
+    expect(mockRmSync).toHaveBeenCalledWith(
+      expect.stringContaining("dist.backup"),
+      { recursive: true, force: true }
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// downloadTarball — fetch-based
+// ---------------------------------------------------------------------------
+
+describe("downloadTarball (fetch-based)", () => {
+  beforeEach(() => {
+    resetMocks();
+    mockMkdtempSync.mockReturnValue("/tmp/podwatch-update-xyz");
+  });
+
+  it("downloads tarball via fetch and writes to temp dir", async () => {
+    const content = Buffer.from("tarball-bytes");
+    mockFetch.mockResolvedValueOnce(binaryResponse(content));
+
+    const result = await downloadTarball("1.2.0");
+    expect(result.success).toBe(true);
+    expect(result.tarballPath).toBe("/tmp/podwatch-update-xyz/podwatch-1.2.0.tgz");
+    expect(mockWriteFileSync).toHaveBeenCalledWith(
+      "/tmp/podwatch-update-xyz/podwatch-1.2.0.tgz",
+      expect.any(Buffer)
+    );
+  });
+
+  it("uses tarballUrl when provided", async () => {
+    const content = Buffer.from("tarball-bytes");
+    mockFetch.mockResolvedValueOnce(binaryResponse(content));
+
+    await downloadTarball("1.2.0", "https://registry.npmjs.org/podwatch/-/podwatch-1.2.0.tgz");
+    expect(mockFetch).toHaveBeenCalledWith(
+      "https://registry.npmjs.org/podwatch/-/podwatch-1.2.0.tgz",
+      expect.objectContaining({ signal: expect.any(AbortSignal) })
+    );
+  });
+
+  it("returns failure on HTTP error", async () => {
+    mockFetch.mockResolvedValueOnce(binaryResponse(Buffer.from(""), 404));
+
+    const result = await downloadTarball("1.2.0");
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("404");
+  });
+
+  it("returns failure on network error", async () => {
+    mockFetch.mockRejectedValueOnce(new Error("network down"));
+
+    const result = await downloadTarball("1.2.0");
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("network down");
   });
 });

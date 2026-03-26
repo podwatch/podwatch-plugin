@@ -25,11 +25,26 @@ import { stopMemoryWatcher } from "../memory-watcher.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-const PLUGIN_VERSION: string = (
-  JSON.parse(
-    fs.readFileSync(path.join(__dirname, "..", "..", "package.json"), "utf-8")
-  ) as { version: string }
-).version;
+// Lazy version read — avoids sync I/O at module level
+let _pluginVersion: string | null = null;
+function getPluginVersion(): string {
+  if (_pluginVersion !== null) return _pluginVersion;
+  try {
+    _pluginVersion = (
+      JSON.parse(
+        fs.readFileSync(path.join(__dirname, "..", "..", "package.json"), "utf-8")
+      ) as { version: string }
+    ).version;
+  } catch {
+    _pluginVersion = "0.0.0";
+  }
+  return _pluginVersion;
+}
+
+/** Allow register() to inject the version. */
+export function setLifecyclePluginVersion(version: string): void {
+  _pluginVersion = version;
+}
 
 let pulseTimer: ReturnType<typeof setTimeout> | null = null;
 let scanTimer: ReturnType<typeof setInterval> | null = null;
@@ -54,6 +69,16 @@ export function registerLifecycleHandlers(api: any, config: PodwatchConfig): voi
   // -----------------------------------------------------------------------
 
   const basePulseIntervalMs = config.pulseIntervalMs ?? 300_000;
+
+  // Clear existing timers before setting new ones (dedup on re-register)
+  if (pulseTimer) {
+    clearTimeout(pulseTimer);
+    pulseTimer = null;
+  }
+  if (scanTimer) {
+    clearInterval(scanTimer);
+    scanTimer = null;
+  }
 
   // Reset pulse backoff state
   pulseFailureCount = 0;
@@ -240,13 +265,28 @@ async function sendPulseWithBackoff(
     checkConfigChanges(api.config);
   }
   let success = false;
+
+  // Respect shared rate limit from transmitter
+  if (transmitter.isRateLimited) {
+    // Skip this pulse but schedule next one
+    if (pulseTimer) clearTimeout(pulseTimer);
+    pulseTimer = setTimeout(
+      () => void sendPulseWithBackoff(endpoint, apiKey, baseIntervalMs, api),
+      baseIntervalMs,
+    );
+    if (pulseTimer && typeof pulseTimer === "object" && "unref" in pulseTimer) {
+      pulseTimer.unref();
+    }
+    return;
+  }
+
   try {
     // Build enriched pulse payload
     const pulsePayload: Record<string, unknown> = {
       ts: Date.now(),
       bufferedEvents: transmitter.bufferedCount,
       uptimeHours: transmitter.getAgentUptimeHours(),
-      pluginVersion: PLUGIN_VERSION,
+      pluginVersion: getPluginVersion(),
     };
 
     // Enrich with system/context info — wrapped in try/catch so failures don't break pulse

@@ -57,6 +57,33 @@ let currentEndpoint = "";
 let currentApiKey = "";
 let isActive = false;
 
+// ─────────────────────────────────────────────────────────────
+// Circuit Breaker — stop sending after consecutive failures
+// ─────────────────────────────────────────────────────────────
+
+const CIRCUIT_BREAKER_THRESHOLD = 5;  // open after 5 consecutive failures
+const CIRCUIT_BREAKER_COOLDOWN_MS = 60_000; // 60s before retrying
+
+let consecutiveSendFailures = 0;
+let circuitBreakerOpenUntil = 0; // timestamp (ms)
+
+/** Reset circuit breaker state (exported for testing). */
+export function resetCircuitBreaker(): void {
+  consecutiveSendFailures = 0;
+  circuitBreakerOpenUntil = 0;
+}
+
+/** Check if circuit breaker is open. */
+function isCircuitBreakerOpen(): boolean {
+  if (circuitBreakerOpenUntil === 0) return false;
+  if (Date.now() >= circuitBreakerOpenUntil) {
+    // Cooldown expired — half-open: allow one attempt
+    circuitBreakerOpenUntil = 0;
+    return false;
+  }
+  return true;
+}
+
 /** Overridable fetch for testing (avoids globalThis.fetch contamination in Bun single-process). */
 let _fetch: typeof fetch = globalThis.fetch;
 
@@ -284,6 +311,11 @@ async function sendSnapshot(
   apiKey: string,
   snapshot: MemorySnapshot
 ): Promise<void> {
+  // Circuit breaker — skip if open
+  if (isCircuitBreakerOpen()) {
+    return;
+  }
+
   try {
     const res = await _fetch(`${endpoint}/memory/snapshot`, {
       method: "POST",
@@ -293,10 +325,30 @@ async function sendSnapshot(
       },
       body: JSON.stringify(snapshot),
     });
-    if (!res.ok) {
+    if (res.ok) {
+      // Reset on success
+      consecutiveSendFailures = 0;
+      circuitBreakerOpenUntil = 0;
+    } else {
+      consecutiveSendFailures++;
+      if (consecutiveSendFailures >= CIRCUIT_BREAKER_THRESHOLD) {
+        circuitBreakerOpenUntil = Date.now() + CIRCUIT_BREAKER_COOLDOWN_MS;
+        console.warn(
+          `[podwatch:memory] Circuit breaker open — ${consecutiveSendFailures} consecutive failures. ` +
+            `Pausing for ${CIRCUIT_BREAKER_COOLDOWN_MS / 1000}s.`
+        );
+      }
       console.warn(`[podwatch:memory] Failed to send snapshot: ${res.status}`);
     }
   } catch (err) {
+    consecutiveSendFailures++;
+    if (consecutiveSendFailures >= CIRCUIT_BREAKER_THRESHOLD) {
+      circuitBreakerOpenUntil = Date.now() + CIRCUIT_BREAKER_COOLDOWN_MS;
+      console.warn(
+        `[podwatch:memory] Circuit breaker open — ${consecutiveSendFailures} consecutive failures. ` +
+          `Pausing for ${CIRCUIT_BREAKER_COOLDOWN_MS / 1000}s.`
+      );
+    }
     console.warn(`[podwatch:memory] Failed to send snapshot:`, err);
   }
 }
@@ -622,6 +674,7 @@ export function startMemoryWatcher(
   currentEndpoint = apiEndpoint;
   currentApiKey = apiKey;
   isActive = true;
+  resetCircuitBreaker();
 
   // Validate workspace
   try {
@@ -715,6 +768,7 @@ export function stopMemoryWatcher(): void {
 
   currentEndpoint = "";
   currentApiKey = "";
+  resetCircuitBreaker();
 }
 
 // ─────────────────────────────────────────────────────────────
