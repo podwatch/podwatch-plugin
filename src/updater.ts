@@ -18,6 +18,7 @@
  */
 
 import { spawnSync } from "node:child_process";
+import { transmitter } from "./transmitter.js";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -717,6 +718,14 @@ export async function runUpdateCheck(
 
       // 7. Write restart sentinel (gateway picks it up on next natural restart)
       writeRestartSentinel(result.remoteVersion);
+
+      // 8. Notify dashboard so user sees the update
+      transmitter.enqueue({
+        type: "alert",
+        ts: Date.now(),
+        message: `Podwatch updated: v${currentVersion} → v${result.remoteVersion}. Restart gateway to activate.`,
+        severity: "info",
+      });
 
       logger.info(
         `[podwatch/updater] Update installed successfully (v${currentVersion} → v${result.remoteVersion}). ` +
