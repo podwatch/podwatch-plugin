@@ -73,9 +73,10 @@ vi.mock("./transmitter.js", () => ({
   },
 }));
 
-// Mock activity-tracker
+// Mock activity-tracker — controllable via mockIsInactive
+const mockIsInactive = vi.fn().mockReturnValue(true); // Default: always idle
 vi.mock("./activity-tracker.js", () => ({
-  isInactive: () => true, // Always idle in tests
+  isInactive: (...args: unknown[]) => mockIsInactive(...args),
 }));
 
 // Mock global fetch (Bun doesn't have vi.stubGlobal)
@@ -96,6 +97,7 @@ function resetMocks() {
   mockRmSync.mockReset();
   mockRenameSync.mockReset();
   mockFetch.mockReset();
+  mockIsInactive.mockReset().mockReturnValue(true); // Default: always idle
 }
 
 // Now import the module under test
@@ -117,6 +119,11 @@ import {
   cleanupBackup,
   installFromTarball,
   downloadTarball,
+  verifyNewDist,
+  waitForIdleWindow,
+  triggerGatewayRestart,
+  acquireUpdateLock,
+  releaseUpdateLock,
 } from "./updater.js";
 
 // ---------------------------------------------------------------------------
@@ -749,8 +756,11 @@ describe("runUpdateCheck — integrity verification", () => {
 
     mockMkdtempSync.mockReturnValue("/tmp/podwatch-update-abc");
 
-    // existsSync: return true for everything (dist/, dist/index.js, backup, etc.)
-    mockExistsSync.mockReturnValue(true);
+    // existsSync: return true for dist/backup/index.js, but false for lock file
+    mockExistsSync.mockImplementation((p: string) => {
+      if (typeof p === "string" && p.includes(".update-lock")) return false;
+      return true;
+    });
 
     // spawnSync calls in order:
     // 1. installFromTarball → tar extract succeeds
@@ -1043,10 +1053,10 @@ describe("rollback mechanism", () => {
     expect(mockRenameSync).toHaveBeenCalledTimes(2);
   });
 
-  it("installFromTarball cleans up backup on success", () => {
-    // dist exists
+  it("installFromTarball leaves fresh backup in place on success (caller manages cleanup)", () => {
+    // dist exists, but NO existing stale backup
     mockExistsSync.mockImplementation((p: string) => {
-      if (typeof p === "string" && p.endsWith("dist.backup")) return true;
+      if (typeof p === "string" && p.endsWith("dist.backup")) return false; // no stale backup
       if (typeof p === "string" && p.endsWith("dist")) return true;
       return false;
     });
@@ -1062,11 +1072,14 @@ describe("rollback mechanism", () => {
     const result = installFromTarball("/tmp/test.tgz");
     expect(result.success).toBe(true);
 
-    // Should have cleaned up backup
-    expect(mockRmSync).toHaveBeenCalledWith(
-      expect.stringContaining("dist.backup"),
-      { recursive: true, force: true }
+    // Fresh backup should NOT be cleaned up by installFromTarball —
+    // caller (runUpdateCheck) cleans up after verifyNewDist
+    // Note: backupDist removes STALE backups before creating new one,
+    // but since no stale backup exists here, rmSync should not be called on dist.backup
+    const backupRmCalls = mockRmSync.mock.calls.filter(
+      (call: unknown[]) => typeof call[0] === "string" && (call[0] as string).includes("dist.backup")
     );
+    expect(backupRmCalls).toHaveLength(0);
   });
 });
 
@@ -1118,5 +1131,377 @@ describe("downloadTarball (fetch-based)", () => {
     const result = await downloadTarball("1.2.0");
     expect(result.success).toBe(false);
     expect(result.error).toContain("network down");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// verifyNewDist
+// ---------------------------------------------------------------------------
+
+describe("verifyNewDist", () => {
+  beforeEach(() => {
+    resetMocks();
+  });
+
+  it("returns ok:false with error when dist/index.js does not exist", () => {
+    mockExistsSync.mockReturnValue(false);
+    const result = verifyNewDist("/ext/podwatch");
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain("not found");
+    // Should not spawn a child process
+    expect(mockSpawnSync).not.toHaveBeenCalled();
+  });
+
+  it("returns ok:true when child process exits 0", () => {
+    mockExistsSync.mockReturnValue(true);
+    mockSpawnSync.mockReturnValueOnce({ error: null, status: 0, stdout: "", stderr: "" });
+
+    const result = verifyNewDist("/ext/podwatch");
+    expect(result.ok).toBe(true);
+    expect(result.error).toBeUndefined();
+    expect(mockSpawnSync).toHaveBeenCalledWith(
+      process.execPath,
+      ["-e", expect.stringContaining("require")],
+      expect.objectContaining({ timeout: 15_000 })
+    );
+  });
+
+  it("returns ok:false with error when child process exits non-zero (broken module)", () => {
+    mockExistsSync.mockReturnValue(true);
+    mockSpawnSync.mockReturnValueOnce({ error: null, status: 1, stdout: "", stderr: "SyntaxError" });
+
+    const result = verifyNewDist("/ext/podwatch");
+    expect(result.ok).toBe(false);
+    expect(result.error).toBe("SyntaxError");
+  });
+
+  it("returns ok:false with timedOut when child process times out", () => {
+    mockExistsSync.mockReturnValue(true);
+    mockSpawnSync.mockReturnValueOnce({
+      error: new Error("ETIMEDOUT"),
+      status: null,
+      stdout: "",
+      stderr: "",
+    });
+
+    const result = verifyNewDist("/ext/podwatch");
+    expect(result.ok).toBe(false);
+    expect(result.timedOut).toBe(true);
+  });
+
+  it("returns ok:false with signal when process crashes", () => {
+    mockExistsSync.mockReturnValue(true);
+    mockSpawnSync.mockReturnValueOnce({
+      error: null,
+      status: null,
+      signal: "SIGSEGV",
+      stdout: "",
+      stderr: "",
+    });
+
+    const result = verifyNewDist("/ext/podwatch");
+    expect(result.ok).toBe(false);
+    expect(result.signal).toBe("SIGSEGV");
+    expect(result.error).toContain("SIGSEGV");
+  });
+
+  it("returns ok:false when spawnSync itself throws", () => {
+    mockExistsSync.mockReturnValue(true);
+    mockSpawnSync.mockImplementationOnce(() => { throw new Error("spawn failed"); });
+
+    const result = verifyNewDist("/ext/podwatch");
+    expect(result.ok).toBe(false);
+    expect(result.error).toBe("spawn failed");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// waitForIdleWindow
+// ---------------------------------------------------------------------------
+
+describe("waitForIdleWindow", () => {
+  beforeEach(() => {
+    resetMocks();
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("returns true immediately when agent is idle", async () => {
+    mockIsInactive.mockReturnValue(true);
+    const logger = mockLogger();
+
+    const result = await waitForIdleWindow(logger);
+    expect(result).toBe(true);
+    expect(logger.info).toHaveBeenCalledWith(
+      expect.stringContaining("idle")
+    );
+  });
+
+  it("defers and re-checks when agent is active, then proceeds when idle", async () => {
+    // Active first call, then idle
+    mockIsInactive.mockReturnValueOnce(false).mockReturnValueOnce(true);
+    const logger = mockLogger();
+
+    const promise = waitForIdleWindow(logger);
+    // Advance timer past the defer interval (5 min = 300000ms)
+    await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
+    const result = await promise;
+
+    expect(result).toBe(true);
+    expect(logger.info).toHaveBeenCalledWith(
+      expect.stringContaining("deferring")
+    );
+  });
+
+  it("forces restart after max deferral period", async () => {
+    // Always active — will hit MAX_DEFER_MS (2 hours)
+    mockIsInactive.mockReturnValue(false);
+    const logger = mockLogger();
+
+    const promise = waitForIdleWindow(logger);
+    // Advance timer past max deferral (2 hours = 24 x 5min intervals)
+    for (let i = 0; i < 25; i++) {
+      await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
+    }
+    const result = await promise;
+
+    expect(result).toBe(false);
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("Forcing restart")
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// triggerGatewayRestart
+// ---------------------------------------------------------------------------
+
+describe("triggerGatewayRestart", () => {
+  let savedPlatform: PropertyDescriptor | undefined;
+
+  beforeEach(() => {
+    resetMocks();
+    savedPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+  });
+
+  afterEach(() => {
+    if (savedPlatform) {
+      Object.defineProperty(process, "platform", savedPlatform);
+    }
+  });
+
+  it("restarts via systemctl --user on Linux", () => {
+    Object.defineProperty(process, "platform", { value: "linux", configurable: true });
+    // systemctl --user succeeds
+    mockSpawnSync.mockReturnValueOnce({ error: null, status: 0, stdout: "", stderr: "" });
+
+    const logger = mockLogger();
+    const result = triggerGatewayRestart(logger);
+
+    expect(result.ok).toBe(true);
+    expect(result.method).toBe("systemd");
+    expect(mockSpawnSync).toHaveBeenCalledWith(
+      "systemctl",
+      ["--user", "restart", expect.stringContaining(".service")],
+      expect.any(Object)
+    );
+  });
+
+  it("falls back to system-level systemctl on Linux when user-level fails", () => {
+    Object.defineProperty(process, "platform", { value: "linux", configurable: true });
+    // user systemctl fails, system succeeds
+    mockSpawnSync
+      .mockReturnValueOnce({ error: null, status: 1, stdout: "", stderr: "failed" })
+      .mockReturnValueOnce({ error: null, status: 0, stdout: "", stderr: "" });
+
+    const logger = mockLogger();
+    const result = triggerGatewayRestart(logger);
+
+    expect(result.ok).toBe(true);
+    expect(result.tried).toHaveLength(2);
+  });
+
+  it("returns ok: false when both systemctl attempts fail on Linux", () => {
+    Object.defineProperty(process, "platform", { value: "linux", configurable: true });
+    mockSpawnSync
+      .mockReturnValueOnce({ error: null, status: 1, stdout: "", stderr: "" })
+      .mockReturnValueOnce({ error: null, status: 1, stdout: "", stderr: "" });
+
+    const logger = mockLogger();
+    const result = triggerGatewayRestart(logger);
+
+    expect(result.ok).toBe(false);
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("Could not restart")
+    );
+  });
+
+  it("returns unsupported for unknown platforms", () => {
+    Object.defineProperty(process, "platform", { value: "freebsd", configurable: true });
+
+    const logger = mockLogger();
+    const result = triggerGatewayRestart(logger);
+
+    expect(result.ok).toBe(false);
+    expect(result.method).toBe("unsupported");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Update lock
+// ---------------------------------------------------------------------------
+
+describe("acquireUpdateLock / releaseUpdateLock", () => {
+  beforeEach(() => {
+    resetMocks();
+  });
+
+  it("acquires lock when no lock file exists", () => {
+    mockExistsSync.mockReturnValue(false);
+
+    expect(acquireUpdateLock()).toBe(true);
+    expect(mockWriteFileSync).toHaveBeenCalledWith(
+      expect.stringContaining(".update-lock"),
+      expect.stringContaining("pid")
+    );
+  });
+
+  it("refuses lock when another process holds a fresh lock", () => {
+    mockExistsSync.mockReturnValue(true);
+    mockReadFileSync.mockReturnValue(
+      JSON.stringify({ pid: 99999, ts: Date.now() })
+    );
+
+    expect(acquireUpdateLock()).toBe(false);
+    // Should NOT overwrite the lock
+    expect(mockWriteFileSync).not.toHaveBeenCalled();
+  });
+
+  it("reclaims stale lock (older than 30 minutes)", () => {
+    mockExistsSync.mockReturnValue(true);
+    const staleTs = Date.now() - 31 * 60 * 1000;
+    mockReadFileSync.mockReturnValue(
+      JSON.stringify({ pid: 99999, ts: staleTs })
+    );
+
+    expect(acquireUpdateLock()).toBe(true);
+    expect(mockWriteFileSync).toHaveBeenCalled();
+  });
+
+  it("reclaims corrupted lock file", () => {
+    mockExistsSync.mockReturnValue(true);
+    mockReadFileSync.mockReturnValue("not json");
+
+    expect(acquireUpdateLock()).toBe(true);
+  });
+
+  it("releaseUpdateLock removes the lock file", () => {
+    mockExistsSync.mockReturnValue(true);
+
+    releaseUpdateLock();
+    expect(mockRmSync).toHaveBeenCalledWith(
+      expect.stringContaining(".update-lock"),
+      { force: true }
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// runUpdateCheck — lock integration
+// ---------------------------------------------------------------------------
+
+describe("runUpdateCheck — update lock", () => {
+  beforeEach(() => {
+    resetMocks();
+  });
+
+  it("skips update when lock is held by another process", async () => {
+    const logger = mockLogger();
+    // shouldCheckForUpdate → true (no cache file exists for first check)
+    mockExistsSync.mockImplementation((p: string) => {
+      if (typeof p === "string" && p.includes(".update-lock")) return true;
+      return false; // no cache file
+    });
+    // Lock file is fresh (held by another process)
+    mockReadFileSync.mockReturnValue(
+      JSON.stringify({ pid: 99999, ts: Date.now() })
+    );
+
+    await runUpdateCheck("1.0.0", "https://podwatch.app/api", logger, { autoUpdate: true });
+
+    expect(logger.info).toHaveBeenCalledWith(
+      expect.stringContaining("Another update is in progress")
+    );
+    // Should not call fetch
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// runUpdateCheck — verifyNewDist rollback (backup preserved)
+// ---------------------------------------------------------------------------
+
+describe("runUpdateCheck — verifyNewDist rollback with backup", () => {
+  beforeEach(() => {
+    resetMocks();
+  });
+
+  it("rolls back from backup when verifyNewDist fails after successful install", async () => {
+    const logger = mockLogger();
+    const crypto = require("node:crypto");
+    const tarballContent = Buffer.from("update with bad dist");
+    const tarballDigest = crypto.createHash("sha512").update(tarballContent).digest("base64");
+    const sriHash = `sha512-${tarballDigest}`;
+
+    // npm registry fails → dashboard has hash
+    mockFetch.mockResolvedValueOnce(jsonResponse({}, 500));
+    mockFetch.mockResolvedValueOnce(jsonResponse({ version: "1.2.0", integrityHash: sriHash }));
+    // downloadTarball fetches the tarball
+    mockFetch.mockResolvedValueOnce(binaryResponse(tarballContent));
+
+    mockMkdtempSync.mockReturnValue("/tmp/podwatch-update-abc");
+
+    // existsSync: true for dist/, dist.backup, lock file (no), cache file (no)
+    mockExistsSync.mockImplementation((p: string) => {
+      if (typeof p === "string" && p.includes(".update-lock")) return false;
+      if (typeof p === "string" && p.includes(".last-update-check")) return false;
+      return true; // dist, dist.backup, dist/index.js all exist
+    });
+
+    // spawnSync calls:
+    // 1. tar extract succeeds
+    // 2. verifyNewDist → child process FAILS (bad dist)
+    mockSpawnSync
+      .mockReturnValueOnce({ error: null, status: 0, stdout: "", stderr: "" })  // tar
+      .mockReturnValueOnce({ error: null, status: 1, stdout: "", stderr: "SyntaxError" }); // verifyNewDist fails
+
+    // readFileSync: only verifyTarballIntegrity calls it (cache file doesn't exist per existsSync mock)
+    mockReadFileSync.mockReturnValueOnce(tarballContent);
+
+    await runUpdateCheck("1.0.0", "https://podwatch.app/api", logger, { autoUpdate: true });
+
+    // Should have logged rollback
+    expect(logger.error).toHaveBeenCalledWith(
+      expect.stringContaining("failed to load")
+    );
+    expect(logger.info).toHaveBeenCalledWith(
+      expect.stringContaining("Rolled back")
+    );
+
+    // Should have restored backup (renameSync called for backup → dist restore)
+    const restoreCalls = mockRenameSync.mock.calls.filter(
+      (call: unknown[]) =>
+        typeof call[0] === "string" && (call[0] as string).includes("dist.backup") &&
+        typeof call[1] === "string" && (call[1] as string).includes("dist")
+    );
+    expect(restoreCalls.length).toBeGreaterThanOrEqual(1);
+
+    // Should have sent error alert to dashboard
+    expect(mockEnqueue).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "alert", severity: "error" })
+    );
   });
 });

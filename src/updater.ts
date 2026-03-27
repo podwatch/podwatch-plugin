@@ -13,7 +13,7 @@
  * - All errors caught — never bricks the running plugin
  * - Rollback: backs up old dist/ before replacing, restores on extraction failure
  * - Plugin NEVER restarts its host — only writes restart sentinel
- * - Auto-update defaults to OFF (opt-in)
+ * - Auto-update defaults to ON (set autoUpdate: false to disable)
  * - No handleUrgentUpdate — removed as remote code execution vector
  */
 
@@ -50,6 +50,8 @@ const CACHE_DIR = path.join(
 );
 
 export const AUTO_UPDATE_CACHE_FILE = path.join(CACHE_DIR, ".last-update-check");
+const UPDATE_LOCK_FILE = path.join(CACHE_DIR, ".update-lock");
+const UPDATE_LOCK_STALE_MS = 30 * 60 * 1000; // 30 minutes — stale lock threshold
 
 // ---------------------------------------------------------------------------
 // State dir resolution (mirrors OpenClaw's resolveStateDir)
@@ -491,10 +493,9 @@ export function installFromTarball(tarballPath: string): UpdateResult {
       };
     }
 
-    // 4. Cleanup backup on success
-    if (backupDir) {
-      cleanupBackup(backupDir);
-    }
+    // 4. Leave backup in place — caller (runUpdateCheck) cleans up after
+    //    verifyNewDist() confirms the new code works. Stale backups from
+    //    prior runs are handled by backupDist() which removes them first.
 
     const tarballName = path.basename(tarballPath);
     return {
@@ -574,24 +575,56 @@ export function executeUpdate(): UpdateResult {
 // Pre-restart verification
 // ---------------------------------------------------------------------------
 
+export interface VerifyDistResult {
+  ok: boolean;
+  error?: string;
+  signal?: string;
+  timedOut?: boolean;
+}
+
 /**
  * Verify that the newly installed dist/index.js is loadable.
  * Tries to require() the entry point — if it throws, the new code is broken.
- * Returns true if the module loads successfully, false otherwise.
+ * Returns a detailed result indicating success or failure reason.
  */
-export function verifyNewDist(extensionsDir: string): boolean {
+export function verifyNewDist(extensionsDir: string): VerifyDistResult {
   const entryPoint = path.join(extensionsDir, "dist", "index.js");
   try {
-    if (!fs.existsSync(entryPoint)) return false;
+    if (!fs.existsSync(entryPoint)) {
+      return { ok: false, error: "dist/index.js not found" };
+    }
     // Use a child process to verify — don't pollute our own module cache
+    // Timeout set to 15s to allow for reasonable module initialization
     const result = spawnSync(
       process.execPath,
       ["-e", `try { require(${JSON.stringify(entryPoint)}); process.exit(0); } catch(e) { console.error(e.message); process.exit(1); }`],
-      { encoding: "utf8", timeout: 10_000 }
+      { encoding: "utf8", timeout: 15_000 }
     );
-    return result.status === 0;
-  } catch {
-    return false;
+
+    // Check for crash signals (SIGSEGV, SIGABRT, etc.)
+    if (result.signal) {
+      return { ok: false, signal: result.signal, error: `Process killed by signal: ${result.signal}` };
+    }
+
+    // Check for timeout
+    if (result.error?.message?.includes("ETIMEDOUT") || result.error?.message?.includes("timed out")) {
+      return { ok: false, timedOut: true, error: "Module load timed out after 15s" };
+    }
+
+    // Check for spawn errors
+    if (result.error) {
+      return { ok: false, error: result.error.message };
+    }
+
+    // Check exit code
+    if (result.status !== 0) {
+      const stderr = result.stderr?.trim();
+      return { ok: false, error: stderr || `Exit code: ${result.status}` };
+    }
+
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
   }
 }
 
@@ -747,8 +780,61 @@ export function triggerGatewayRestart(
 // ---------------------------------------------------------------------------
 
 export interface UpdateOptions {
-  /** Enable auto-update. Default: false (opt-in for security). */
+  /** Enable auto-update. Default: true (set to false to disable). */
   autoUpdate?: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Update lock (prevents concurrent update attempts)
+// ---------------------------------------------------------------------------
+
+/**
+ * Acquire an exclusive update lock. Returns true if acquired, false if
+ * another update is already in progress (or the lock is stale and was reclaimed).
+ */
+export function acquireUpdateLock(): boolean {
+  try {
+    fs.mkdirSync(CACHE_DIR, { recursive: true });
+
+    // Check for existing lock
+    if (fs.existsSync(UPDATE_LOCK_FILE)) {
+      try {
+        const raw = fs.readFileSync(UPDATE_LOCK_FILE, "utf-8");
+        const data = JSON.parse(raw) as { pid?: number; ts?: number };
+        const age = Date.now() - (data.ts ?? 0);
+
+        // Stale lock — reclaim it
+        if (age > UPDATE_LOCK_STALE_MS) {
+          console.warn("[podwatch/updater] Reclaiming stale update lock.");
+        } else {
+          return false; // Lock is held by another process
+        }
+      } catch {
+        // Corrupted lock file — reclaim
+      }
+    }
+
+    fs.writeFileSync(
+      UPDATE_LOCK_FILE,
+      JSON.stringify({ pid: process.pid, ts: Date.now() })
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Release the update lock.
+ */
+export function releaseUpdateLock(): void {
+  try {
+    if (fs.existsSync(UPDATE_LOCK_FILE)) {
+      fs.rmSync(UPDATE_LOCK_FILE, { force: true });
+    }
+  } catch {
+    // Best-effort
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -759,7 +845,7 @@ export interface UpdateOptions {
  * Schedule a non-blocking update check 30s after startup.
  * Safe to call synchronously — it sets a timer and returns immediately.
  *
- * Auto-update is OFF by default. Set autoUpdate: true in plugin config to enable.
+ * Auto-update is ON by default. Set autoUpdate: false in plugin config to disable.
  *
  * @param currentVersion The plugin's current version from package.json
  * @param endpoint The Podwatch API endpoint (for dashboard fallback)
@@ -786,14 +872,17 @@ export function scheduleUpdateCheck(
  * Internal: perform the actual update check + install.
  *
  * Flow:
- * 1. Check autoUpdate opt-in (default false)
+ * 1. Check autoUpdate opt-out (default on; set autoUpdate: false to disable)
  * 2. Respect 24h cooldown
- * 3. Check for newer version (npm → dashboard fallback)
- * 4. Require integrity hash from server (skip if missing)
- * 5. Download tarball via fetch
- * 6. Verify tarball integrity against server hash
- * 7. Extract and install (with rollback on failure)
- * 8. Write restart sentinel (gateway picks it up on next restart)
+ * 3. Acquire update lock (prevents concurrent updates)
+ * 4. Check for newer version (npm → dashboard fallback)
+ * 5. Require integrity hash from server (skip if missing)
+ * 6. Download tarball via fetch
+ * 7. Verify tarball integrity against server hash
+ * 8. Extract and install (with rollback on failure)
+ * 9. Verify new dist loads; rollback if broken
+ * 10. Write restart sentinel (gateway picks it up on next restart)
+ * 11. Wait for idle window, then restart gateway
  */
 export async function runUpdateCheck(
   currentVersion: string,
@@ -801,8 +890,9 @@ export async function runUpdateCheck(
   logger: { info: (msg: string) => void; warn: (msg: string) => void; error: (msg: string) => void },
   options: UpdateOptions = {}
 ): Promise<void> {
+  let lockAcquired = false;
   try {
-    // 1. Check opt-in — auto-update must be explicitly enabled
+    // 1. Check opt-in — auto-update must be explicitly disabled
     if (options.autoUpdate === false) {
       logger.info("[podwatch/updater] Auto-update is disabled. Remove autoUpdate: false from plugin config to re-enable.");
       return;
@@ -813,6 +903,13 @@ export async function runUpdateCheck(
       console.log("[podwatch/updater] Skipping check — within 24h cooldown.");
       return;
     }
+
+    // 3. Acquire update lock (prevents concurrent updates)
+    if (!acquireUpdateLock()) {
+      logger.info("[podwatch/updater] Another update is in progress — skipping.");
+      return;
+    }
+    lockAcquired = true;
 
     logger.info("[podwatch/updater] Checking for updates...");
 
@@ -900,26 +997,36 @@ export async function runUpdateCheck(
         process.env.HOME ?? process.env.USERPROFILE ?? "/tmp",
         ".openclaw", "extensions", "podwatch"
       );
-      const distOk = verifyNewDist(extensionsDir);
+      const distResult = verifyNewDist(extensionsDir);
 
-      if (!distOk) {
+      const backupDir = path.join(extensionsDir, "dist.backup");
+
+      if (!distResult.ok) {
+        const reason = distResult.signal
+          ? `crashed with signal ${distResult.signal}`
+          : distResult.timedOut
+            ? "timed out during load"
+            : distResult.error || "unknown error";
         logger.error(
-          `[podwatch/updater] New dist/index.js failed to load! Rolling back to previous version.`
+          `[podwatch/updater] New dist/index.js failed to load (${reason})! Rolling back to previous version.`
         );
-        // installFromTarball has its own rollback, but if it succeeded and the JS is still broken:
-        const backupDir = path.join(extensionsDir, "dist.backup");
         if (fs.existsSync(backupDir)) {
           restoreFromBackup(extensionsDir, backupDir);
           logger.info("[podwatch/updater] Rolled back to previous version.");
+        } else {
+          logger.error("[podwatch/updater] No backup available for rollback — previous dist lost.");
         }
         transmitter.enqueue({
           type: "alert",
           ts: Date.now(),
-          message: `Podwatch update to v${result.remoteVersion} failed verification — rolled back. Please report this.`,
+          message: `Podwatch update to v${result.remoteVersion} failed verification (${reason}) — rolled back. Please report this.`,
           severity: "error",
         });
         return;
       }
+
+      // 7b. Verification passed — clean up backup now
+      cleanupBackup(backupDir);
 
       // 8. Write restart sentinel
       writeRestartSentinel(result.remoteVersion);
@@ -959,5 +1066,7 @@ export async function runUpdateCheck(
   } catch (err) {
     // Catch-all: never let the updater crash the plugin
     console.error("[podwatch/updater] Unexpected error:", err);
+  } finally {
+    if (lockAcquired) releaseUpdateLock();
   }
 }
